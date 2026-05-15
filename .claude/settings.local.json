@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "PowerShell(cmd /c '\"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\VC\\\\Auxiliary\\\\Build\\\\vcvarsall.bat\" x64 && cd /d \"C:\\\\dev\\\\pyav-build\\\\av-17.0.1\" && \"C:\\\\dev\\\\ffrecord\\\\venv\\\\Scripts\\\\python.exe\" setup.py bdist_wheel \"--ffmpeg-dir=C:\\\\Users\\\\Gam3r1\\\\Downloads\\\\ffmpeg for pyav\" 2>&1')",
-      "PowerShell(& \"C:\\\\dev\\\\ffrecord\\\\venv\\\\Scripts\\\\python.exe\" -c \"import av; print\\('av version:', av.__version__\\); print\\('NVENC available:', 'h264_nvenc' in [c.name for c in av.codecs_available]\\)\")",
-      "PowerShell(cd C:\\\\dev\\\\ffrecord; $env:PATH = \"C:\\\\dev\\\\ffrecord\\\\vendor\\\\ffmpeg-dlls;$env:PATH\"; venv\\\\Scripts\\\\python.exe -c \"import av; print\\(av.__version__\\); ctx = av.CodecContext.create\\('aac', 'w'\\); print\\('aac fmt:', ctx.format\\); ctx2 = av.CodecContext.create\\('pcm_s24le', 'w'\\); print\\('pcm_s24le fmt:', ctx2.format\\)\")"
-    ]
-  }
-}
