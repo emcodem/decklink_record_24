@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ffrecord"
+version = "0.1.0"
+description = "24/7 SDI recording service with multiple parallel outputs"
+requires-python = ">=3.11"
+dependencies = [
+    "av==17.0.1",
+    "PyYAML",
+    "comtypes",
+    "numpy",
+]
+
+[project.scripts]
+ffrecord = "ffrecord.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# PyAV / FFmpeg (Windows, NVENC):
+# vendor/av-17.0.1-cp311-abi3-win_amd64.whl  — PyAV 17.0.1 built from source (NVENC-enabled)
+# vendor/ffmpeg-dlls/                          — FFmpeg 8.1.1 full-shared DLLs (gyan.dev)
+#
+# Install:  pip install -e . --find-links=vendor/
+#   (pip prefers the local wheel over PyPI; see install.ps1)
+#
+# To rebuild the wheel (e.g. after a Python or FFmpeg version change):
+#   1. Download FFmpeg full-shared build from https://www.gyan.dev/ffmpeg/builds/
+#      and extract to C:\ffmpeg
+#   2. pip install cython
+#   3. pip download av==17.0.1 --no-binary av --no-deps -d C:\pyav-build
+#   4. tar -xzf C:\pyav-build\av-17.0.1.tar.gz -C C:\pyav-build
+#   5. From an MSVC x64 prompt (vcvarsall.bat x64):
+#        cd C:\pyav-build\av-17.0.1
+#        python setup.py bdist_wheel "--ffmpeg-dir=C:\ffmpeg"
+#   6. Replace vendor/av-17.0.1-cp311-abi3-win_amd64.whl with the new wheel
+#   7. Replace vendor/ffmpeg-dlls/*.dll with the new FFmpeg bin DLLs
+#   8. pip install -e . --find-links=vendor/

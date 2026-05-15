@@ -1,0 +1,131 @@
+# ffrecord example configuration — one file per service instance (one per SDI channel)
+#
+# Start with:  ffrecord --config config\example.yaml
+# Or:          python -m ffrecord.main --config config\example.yaml
+
+channel:
+  name: CH1                      # Supported: any string. Used in path templates as {CH} and in log filenames.
+  decklink_device_index: 0       # Supported: integer >= 0. 0 = first DeckLink device enumerated by the SDK.
+  # expected_format is informational only; actual format comes from VideoInputFormatChanged.
+  expected_format: 1080i25       # Supported: any string. Common values: 1080i25, 1080i30, 1080p25, 1080p50, 720p50, 2160p25.
+
+capture:
+  audio_channels: 8              # Supported: integer 1..16. How many SDI audio channels to ingest.
+  pix_fmt: yuv420p               # Supported: any ffmpeg pix_fmt. Common: yuv420p, yuv422p, yuv444p, p010le, yuv422p10le, nv12.
+                                 # This is the target output format for the filter chain (auto-appended as a `format=` filter).
+  # video_filter — full ffmpeg-style filter chain, comma-separated. Leave empty
+  # ("") for passthrough (raw uyvy422 straight to the encoder, no filter graph).
+  # The graph's actual output framerate/size/pix_fmt are queried after build and
+  # propagated to the encoder, so a filter that changes the rate (e.g. bwdif=mode=1
+  # 25→50 fps) is handled correctly without manual config.
+  # Commas inside filter args are supported via single-quoted regions
+  # (text='hello, world') or backslash escapes (text=hello\, world), so most
+  # working ffmpeg `-vf` strings can be pasted verbatim.
+  #
+  # Pasting from a working `ffmpeg -vf "<chain>"` Windows command:
+  #   1. Strip the `-vf` flag and the outer shell quotes that wrap the chain.
+  #   2. Keep ffmpeg's INNER quoting/escaping intact — single quotes ('…') and
+  #      backslash escapes (\,) are passed through to libavfilter.
+  #   3. Wrap the result for YAML using one of:
+  #        • Single-quoted YAML  →  preserves backslashes verbatim (recommended
+  #          when the chain contains `\,` escapes). Any literal `'` inside must
+  #          be doubled (`''`) per YAML rules.
+  #            video_filter: 'drawtext=text=hello\, world:fontsize=20,format=yuv420p'
+  #        • Double-quoted YAML  →  YAML eats backslashes, so each `\` must be
+  #          doubled (`\\,`). Use this when the chain contains single quotes
+  #          you don't want to double up.
+  #            video_filter: "drawtext=text='hello, world':fontsize=20,format=yuv420p"
+  #            video_filter: "drawtext=text=hello\\, world:fontsize=20,format=yuv420p"
+  #
+  # Examples:
+  #   yadif=mode=0:parity=auto:deint=interlaced,format=yuv420p   # 25i → 25p
+  #   bwdif=mode=1:parity=-1:deint=0,format=yuv420p              # 25i → 50p
+  #   scale=1280:720:flags=lanczos,format=yuv420p                # downscale
+  #   drawtext=text='CH1, live':fontsize=24:x=10:y=10,format=yuv420p   # quoted comma
+  video_filter: "yadif=mode=0:parity=auto:deint=interlaced,format=yuv420p"
+
+http:
+  bind: 127.0.0.1                # Supported: any IPv4/IPv6 address string. 0.0.0.0 = all interfaces.
+  port: 8081                     # Supported: integer 1..65535.
+  # Endpoints:
+  #   GET  /status                  — full status JSON
+  #   GET  /healthz                 — "ok\n" for supervisor health checks
+  #   POST /pause                   — pause all output writing (capture keeps running)
+  #   POST /resume                  — resume all output writing
+  #   POST /outputs/{name}/enable   — enable a specific output
+  #   POST /outputs/{name}/disable  — disable a specific output
+
+logging:
+  dir: logs                      # Supported: any path (relative to CWD or absolute).
+  file_rotation_days: 7          # Supported: integer >= 1. Days of logs to retain per channel.
+  level: INFO                    # Supported: DEBUG | INFO | WARNING | ERROR
+
+outputs:
+  # ── HLS live preview (low-latency, rolling 2-chunk window) ──────────────────
+  - name: hls_preview            # Supported: any unique string identifier.
+    type: hls                    # Supported: hls | file
+    enabled: true                # Supported: true | false
+    # path_template — placeholders: {output}, {CH}, {YYYYMMDDHH}, {starttime_unix_ms}, {seq}
+    path_template: "recording/{output}/{CH}/playlist.m3u8"
+    segment_seconds: 2           # Supported: integer >= 1. HLS chunk duration.
+    hls_list_size: 2             # Supported: integer >= 1. HLS-only: how many .ts segments to keep in playlist.
+    video:
+      codec: h264_nvenc          # Supported: any ffmpeg encoder. Common: h264_nvenc, hevc_nvenc, libx264, libx265.
+      preset: p4                 # Supported (NVENC): p1 (fastest) … p7 (slowest/best quality). For libx264: ultrafast..veryslow.
+      bitrate: "4000k"           # Supported: <number>[k|M] (e.g. "4000k", "8M"). Required for lossy codecs.
+      # pix_fmt — supported: any ffmpeg pix_fmt matching the codec/profile. Default: yuv420p.
+      # profile — supported (HEVC NVENC on this machine): main, main10. (main422-10 fails — GPU limitation.)
+      # Any extra PyAV codec options can be added under 'options':
+      # options:
+      #   rc: cbr                # ffmpeg codec option key:value pairs passed through
+    audio:
+      channels: [1, 2]                # Supported: list of 1-based SDI channel indices in 1..16.
+      downmix: stereo                 # Supported: stereo | none
+      track_mode: combined            # Supported: combined | mono_per_channel
+                                      #   combined         = one stream with N channels (legacy/default)
+                                      #   mono_per_channel = N separate mono streams (broadcast/NLE-friendly)
+                                      #   Note: ignored when downmix=stereo.
+      codec: aac                      # Supported: any ffmpeg audio encoder. Common: aac, pcm_s16le, pcm_s24le.
+      bitrate: "128k"                 # Supported: <number>[k|M]. Not applicable to PCM codecs.
+
+  # ── High-res archive (10-second MOV segments, all 8 audio channels) ─────────
+  # Container is MOV (QuickTime). MXF was rejected by FFmpeg's muxer for HEVC
+  # essence ("Operation not permitted" / AVERROR(EPERM)). MOV accepts HEVC,
+  # H.264, ProRes, etc., and supports multi-channel PCM audio.
+  - name: archive
+    type: file                   # Supported: file (segmented MOV/MP4) | hls
+    enabled: true
+    # {YYYYMMDDHH} = UTC hour directory, {starttime_unix_ms} = segment start timestamp
+    path_template: "recording/{output}/{CH}/{YYYYMMDDHH}/{starttime_unix_ms}.mov"
+    segment_seconds: 10          # Supported: integer >= 1. Exact duration in video frames (deterministic).
+    video:
+      codec: hevc_nvenc          # Supported: hevc_nvenc, h264_nvenc, libx264, libx265, prores_ks, etc.
+      profile: main10            # Supported (hevc_nvenc on this GPU): main, main10. (main422-10 fails.)
+      pix_fmt: p010le            # Supported: yuv420p (main), p010le (main10), yuv422p10le (main422-10 only).
+      preset: p7                 # Supported (NVENC): p1..p7.
+      bitrate: "50M"             # Supported: <number>[k|M].
+      # For 4:2:2 10-bit (main422-10 profile) change pix_fmt to yuv422p10le
+      # and note it requires Turing+ (RTX 20xx) or newer NVENC hardware.
+    audio:
+      channels: [1, 2, 3, 4, 5, 6, 7, 8]   # Supported: list of 1-based SDI channel indices in 1..16.
+      downmix: none                        # Supported: stereo | none
+      track_mode: mono_per_channel         # Supported: combined | mono_per_channel
+                                           # 8 separate mono tracks (broadcast/NLE-friendly).
+      codec: pcm_s24le                     # Supported: pcm_s16le, pcm_s24le, pcm_s32le, aac.
+      # bitrate not applicable for PCM
+
+  # ── Proxy MP4 (same source, lighter bitrate for NLE import) ─────────────────
+  # - name: proxy_mp4
+  #   type: file
+  #   enabled: false
+  #   path_template: "{output}/{CH}/{YYYYMMDDHH}/{starttime_unix_ms}.mp4"
+  #   segment_seconds: 600
+  #   video:
+  #     codec: h264_nvenc
+  #     preset: p4
+  #     bitrate: "8M"
+  #   audio:
+  #     channels: [1, 2]
+  #     downmix: stereo
+  #     codec: aac
+  #     bitrate: "192k"
