@@ -70,6 +70,12 @@ class HlsOutput(OutputThread):
                         vstream.bit_rate = _parse_bitrate(vcfg.bitrate)
                     if vcfg.options:
                         vstream.codec_context.options.update({k: str(v) for k, v in vcfg.options.items()})
+                    # HLS cuts at keyframe boundaries, so force GOP = segment_seconds * fps.
+                    # Without this, nvenc's default ~250-frame GOP produces ~10s segments
+                    # regardless of hls_time. User can override via vcfg.options["g"].
+                    if "g" not in vstream.codec_context.options:
+                        gop_frames = max(1, round(float(rate) * self.cfg.segment_seconds))
+                        vstream.codec_context.options["g"] = str(gop_frames)
 
                     acfg = self.cfg.audio
                     out_channels = 2 if acfg.downmix == "stereo" else len(acfg.channels)
