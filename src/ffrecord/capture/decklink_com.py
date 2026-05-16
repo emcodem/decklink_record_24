@@ -65,11 +65,12 @@ def _create_input_callback(
     audio_channels: int,
     decklink_input,
     format_change_callback: Optional[Callable] = None,
+    shared_framerate: Optional[list] = None,
 ):
     """Return a COM-backed IDeckLinkInputCallback."""
     from comtypes import COMObject
 
-    _framerate = [None]
+    _framerate = shared_framerate if shared_framerate is not None else [None]
     _current_mode = [None]
     _video_hw_pts_fail = [0]
     _audio_hw_pts_fail = [0]
@@ -325,6 +326,7 @@ class DeckLinkCapture:
         self._display_name = "Unknown"
         self._callback_com = None
         self._started = False
+        self._shared_framerate: list = [None]   # shared with the callback closure
 
         self._frame_callback: Optional[Callable] = None
         self._audio_callback: Optional[Callable] = None
@@ -348,13 +350,32 @@ class DeckLinkCapture:
         self._frame_callback = frame_callback
         self._audio_callback = audio_callback
 
-        hr = self._decklink_input.EnableVideoInput(
-            _dl.bmdModeHD1080i50,
-            _dl.bmdFormat8BitYUV,
-            _dl.bmdVideoInputEnableFormatDetection,
-        )
-        if hr != 0:
-            raise RuntimeError(f"EnableVideoInput failed: {hr:#010x}")
+        # bmdModeUnknown tells the SDK there is no assumed format, so VideoInputFormatChanged
+        # is guaranteed to fire for any live signal — even when the signal matches the old hint.
+        # Fall back to bmdModeHD1080i50 for devices that reject bmdModeUnknown.
+        _bmd_mode_unknown = getattr(_dl, 'bmdModeUnknown', 0x69756E6B)
+        try:
+            hr = self._decklink_input.EnableVideoInput(
+                _bmd_mode_unknown,
+                _dl.bmdFormat8BitYUV,
+                _dl.bmdVideoInputEnableFormatDetection,
+            )
+            if hr != 0:
+                raise RuntimeError(f"hr=0x{hr:08x}")
+            logger.debug("EnableVideoInput: bmdModeUnknown accepted")
+        except Exception as e:
+            logger.debug("bmdModeUnknown rejected (%s) — falling back to bmdModeHD1080i50", e)
+            try:
+                self._decklink_input.DisableVideoInput()
+            except Exception:
+                pass
+            hr = self._decklink_input.EnableVideoInput(
+                _dl.bmdModeHD1080i50,
+                _dl.bmdFormat8BitYUV,
+                _dl.bmdVideoInputEnableFormatDetection,
+            )
+            if hr != 0:
+                raise RuntimeError(f"EnableVideoInput failed: {hr:#010x}")
 
         hr = self._decklink_input.EnableAudioInput(
             _dl.bmdAudioSampleRate48kHz,
@@ -366,9 +387,11 @@ class DeckLinkCapture:
         else:
             logger.info("Audio input enabled (%d channels)", self.audio_channels)
 
+        self._shared_framerate[0] = None  # reset in case of restart
         self._callback_com = _create_input_callback(
             frame_callback, audio_callback, self.audio_channels,
             self._decklink_input, self.format_change_callback,
+            shared_framerate=self._shared_framerate,
         )
         hr = self._decklink_input.SetCallback(self._callback_com)
         if hr != 0:
@@ -380,6 +403,76 @@ class DeckLinkCapture:
 
         self._started = True
         logger.info("DeckLink capture started")
+
+        threading.Thread(
+            target=self._probe_format_if_needed,
+            name="format-probe", daemon=True,
+        ).start()
+
+    def _probe_format_if_needed(self) -> None:
+        """Probe the current input format via IDeckLinkStatus if VideoInputFormatChanged doesn't fire within 1s.
+
+        Some DeckLink driver versions skip the initial VideoInputFormatChanged callback when the
+        incoming signal format matches the mode passed to EnableVideoInput. This probe covers that gap.
+        """
+        import time
+        time.sleep(1.0)
+
+        if self._shared_framerate[0] is not None or not self._started:
+            return
+
+        logger.info("VideoInputFormatChanged not received within 1s — probing input format via IDeckLinkStatus")
+
+        # Step 1: query the currently detected video input mode constant
+        try:
+            status = self._decklink_input.QueryInterface(_dl.IDeckLinkStatus)
+            mode_constant = status.GetInt(
+                getattr(_dl, 'bmdDeckLinkStatusCurrentVideoInputMode', 0x76697666)
+            )
+        except Exception as e:
+            logger.warning("IDeckLinkStatus probe failed: %s", e)
+            return
+
+        if not mode_constant:
+            logger.warning("IDeckLinkStatus reports no signal (mode=0) — check SDI cable and source")
+            return
+
+        # Step 2: walk IDeckLinkInput's display mode iterator to find the matching mode and read its framerate
+        try:
+            dl_input = self._decklink_input.QueryInterface(_dl.IDeckLinkInput)
+            mode_iter = dl_input.GetDisplayModeIterator()
+        except Exception as e:
+            logger.warning("GetDisplayModeIterator failed: %s", e)
+            return
+
+        try:
+            while True:
+                try:
+                    dm = mode_iter.Next()
+                except Exception:
+                    break
+                if dm is None:
+                    break
+                try:
+                    if dm.GetDisplayMode() != mode_constant:
+                        continue
+                    mode_name = dm.GetName()
+                    raw = dm.GetFrameRate()
+                    fps_num, fps_den = int(raw[1]), int(raw[0])
+                    self._shared_framerate[0] = (fps_num, fps_den)
+                    logger.info("Probed input format: '%s' fps=%d/%d — frames will now flow", mode_name, fps_num, fps_den)
+                    if self.format_change_callback:
+                        try:
+                            self.format_change_callback(f"{mode_name} (probed at startup)")
+                        except Exception as cb_err:
+                            logger.error("format_change_callback error: %s", cb_err)
+                    return
+                except Exception as e:
+                    logger.debug("Mode entry query error: %s", e)
+                    continue
+            logger.warning("Signal detected (mode=0x%08x) but not found in display mode iterator", mode_constant)
+        except Exception as e:
+            logger.warning("Display mode enumeration failed: %s", e)
 
     def stop(self) -> None:
         if not self._started:
