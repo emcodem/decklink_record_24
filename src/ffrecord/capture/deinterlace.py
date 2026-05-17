@@ -116,6 +116,12 @@ class VideoFilter:
         if self._spec:
             self._build_graph()
             self._query_sink()
+            # If _query_sink() couldn't determine a different framerate (e.g.
+            # sink.frame_rate unsupported in this PyAV version), probe empirically
+            # by pushing test frames and counting outputs.  The graph is rebuilt
+            # afterwards so real capture starts from a clean state.
+            if self.output_framerate == self.input_framerate:
+                self._probe_output_framerate()
             logger.info(
                 "Filter graph configured: '%s' | input %dx%d uyvy422 @ %d/%d → "
                 "output %dx%d %s @ %d/%d",
@@ -139,6 +145,7 @@ class VideoFilter:
             f"video_size={self.input_width}x{self.input_height}:"
             f"pix_fmt={av.video.format.VideoFormat('uyvy422').name}:"
             f"time_base={fps_den}/{fps_num}:"
+            f"frame_rate={fps_num}/{fps_den}:"
             f"pixel_aspect=1/1"
         )
         src = graph.add("buffer", buffer_args)
@@ -201,10 +208,49 @@ class VideoFilter:
 
         try:
             fr = sink.frame_rate
-            if fr is not None and getattr(fr, "denominator", 0):
+            if fr is not None and getattr(fr, "denominator", 0) and getattr(fr, "numerator", 0):
                 self.output_framerate = (int(fr.numerator), int(fr.denominator))
         except (AttributeError, TypeError):
             pass
+
+    def _probe_output_framerate(self) -> None:
+        """Push blank test frames through the graph and count outputs to determine
+        the actual output framerate multiplier.  Rebuilds the graph afterwards so
+        real capture starts from a clean state.
+
+        Handles filters like yadif=mode=1 that buffer the first input frame:
+        using 6 test frames, even if frame 0 yields only 1 output instead of 2,
+        the ratio still rounds to the correct integer multiplier.
+        """
+        if self._src is None or self._sink is None:
+            return
+
+        probe_count = 6
+        frames_out = 0
+        for i in range(probe_count):
+            test = av.VideoFrame(self.input_width, self.input_height, "uyvy422")
+            test.pts = i
+            self._src.push(test)
+            while True:
+                try:
+                    self._sink.pull()
+                    frames_out += 1
+                except av.BlockingIOError:
+                    break
+
+        if frames_out > 0:
+            multiplier = round(frames_out / probe_count)
+            if multiplier > 0:
+                fps_num, fps_den = self.input_framerate
+                self.output_framerate = (fps_num * multiplier, fps_den)
+                logger.info(
+                    "Probed filter output: %d frames in → %d out → multiplier=%d → framerate %d/%d",
+                    probe_count, frames_out, multiplier,
+                    self.output_framerate[0], self.output_framerate[1],
+                )
+
+        # Rebuild to start real capture from a clean state (yadif carries lookahead state)
+        self._build_graph()
 
     def process(self, frame_bytes: bytes, width: int, height: int,
                 row_bytes: int) -> Generator[np.ndarray, None, None]:

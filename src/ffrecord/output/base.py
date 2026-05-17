@@ -12,6 +12,8 @@ from typing import Optional
 
 import numpy as np
 
+from ..sync_log import log_dropped_frame
+
 logger = logging.getLogger(__name__)
 
 
@@ -76,6 +78,7 @@ class OutputThread(ABC):
         self._stop_event = threading.Event()
         self._format_change_pending = threading.Event()
         self._log = logging.getLogger(f"ffrecord.output.{name}")
+        self._queue_near_full = False   # True while qsize >= QUEUE_MAXSIZE - 2
 
     # ── public API (called from capture/service thread) ──────────────────────
 
@@ -147,12 +150,27 @@ class OutputThread(ABC):
     def push_video(self, frame: VideoFrame) -> None:
         if not self.stats.enabled or self.stats.paused:
             return
+        qsize = self._video_queue.qsize()
+        near_full = qsize >= self.QUEUE_MAXSIZE - 2
+        if near_full and not self._queue_near_full:
+            self._log.warning(
+                "[sync] QUEUE_NEAR_FULL output=%s qsize=%d/%d — encoder falling behind",
+                self.name, qsize, self.QUEUE_MAXSIZE,
+            )
+            self._queue_near_full = True
+        elif not near_full and self._queue_near_full:
+            self._log.info(
+                "[sync] QUEUE_RECOVERED output=%s qsize=%d/%d",
+                self.name, qsize, self.QUEUE_MAXSIZE,
+            )
+            self._queue_near_full = False
         try:
             self._video_queue.put_nowait(frame)
         except queue.Full:
             self.stats.frames_dropped += 1
-            if self.stats.frames_dropped % 100 == 1:
-                self._log.warning("[sync] DROPPED output=%s total=%d", self.name, self.stats.frames_dropped)
+            count = self.stats.frames_dropped
+            if count in (1, 10, 100, 1000) or (count > 1000 and count % 1000 == 0):
+                log_dropped_frame(self.name, count)
 
     def push_audio(self, pkt: AudioPacket) -> None:
         if not self.stats.enabled or self.stats.paused:

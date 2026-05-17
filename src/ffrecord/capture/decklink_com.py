@@ -21,7 +21,8 @@ from typing import Callable, Optional
 import numpy as np
 
 from ..sync_log import (
-    log_audio_packet, log_av_lag, log_signal_loss, log_signal_return, log_video_frame,
+    log_audio_packet, log_av_lag, log_missed_frames, log_psf_frame,
+    log_signal_loss, log_signal_return, log_video_frame,
 )
 
 logger = logging.getLogger("ffrecord.capture")
@@ -79,6 +80,9 @@ def _create_input_callback(
     _diag_audio = [0]
     _frame_n = [0]
     _audio_n = [0]
+    _last_stream_time = [None]   # stream_time of the most-recently-delivered frame
+    _last_frame_duration = [0]   # duration (ticks) of that frame, used to predict next
+    _decklink_qdepth_high = [False]   # True while driver queue depth >= threshold
 
     class _CB(COMObject):
         _com_interfaces_ = [_dl.IDeckLinkInputCallback]
@@ -124,6 +128,9 @@ def _create_input_callback(
                 _current_mode[0] = mode_constant
                 _diag_frames[0] = 0
                 _diag_audio[0] = 0
+                _last_stream_time[0] = None
+                _last_frame_duration[0] = 0
+                _decklink_qdepth_high[0] = False
 
                 if decklink_input is not None and mode_constant is not None:
                     try:
@@ -167,7 +174,11 @@ def _create_input_callback(
                         no_signal = bool(flags & getattr(_dl, 'bmdFrameHasNoInputSource',
                                                          from_comtypes_or_default('bmdFrameHasNoInputSource', 1 << 5)))
                         if no_signal:
-                            log_signal_loss("bmdFrameHasNoInputSource")
+                            log_signal_loss("bmdFrameHasNoInputSource mitigation=frame_passed_flagged")
+
+                        # Detect Progressive Segmented Frame (PsF) — looks interlaced at transport level but is progressive
+                        if flags & (1 << 30):  # bmdFrameCapturedAsPsF
+                            log_psf_frame()
 
                         # Stream time (same clock domain as audio)
                         video_stream_time = 0
@@ -183,12 +194,27 @@ def _create_input_callback(
                             _log_graduated("ffrecord.capture", _video_hw_pts_fail[0],
                                            "GetStreamTime failed", e)
 
+                        # Detect gaps in DeckLink frame delivery
+                        if (stream_time_valid
+                                and _last_stream_time[0] is not None
+                                and _last_frame_duration[0] > 0):
+                            expected_pts = _last_stream_time[0] + _last_frame_duration[0]
+                            gap_ticks = video_stream_time - expected_pts
+                            if gap_ticks > _last_frame_duration[0] // 2:
+                                gap_frames = max(1, round(gap_ticks / _last_frame_duration[0]))
+                                log_missed_frames(
+                                    gap_frames, expected_pts, video_stream_time,
+                                    "pts_gap_tolerated",
+                                )
+
                         # Hardware reference timestamp (independent wall clock)
                         hw_ref_time = 0
+                        hw_ref_time_in_frame = 0  # position within frame; useful for sub-frame jitter analysis
                         hw_ref_valid = False
                         try:
                             raw_hw = videoFrame.GetHardwareReferenceTimestamp(TIMESCALE)
                             hw_ref_time = int(raw_hw[0])
+                            hw_ref_time_in_frame = int(raw_hw[1])
                             hw_ref_valid = True
                         except Exception as e:
                             _hw_ref_fail[0] += 1
@@ -209,10 +235,37 @@ def _create_input_callback(
                         except Exception:
                             pass
 
-                        # Input queue depth
+                        # Input queue depths (video frames and audio samples buffered in driver)
                         queue_depth = 0
                         try:
                             queue_depth = decklink_input.GetAvailableVideoFrameCount()
+                        except Exception:
+                            pass
+
+                        # Warn when the DeckLink driver's internal ring buffer is filling up.
+                        # A depth >= 3 means the callback thread is slower than frame arrival;
+                        # the driver will start dropping frames at its ring buffer limit.
+                        _DECKLINK_QDEPTH_THRESHOLD = 3
+                        qdepth_high = queue_depth >= _DECKLINK_QDEPTH_THRESHOLD
+                        if qdepth_high and not _decklink_qdepth_high[0]:
+                            logger.warning(
+                                "[sync] DECKLINK_BUFFER_HIGH qdepth=%d — callback thread falling behind",
+                                queue_depth,
+                            )
+                            _decklink_qdepth_high[0] = True
+                        elif not qdepth_high and _decklink_qdepth_high[0]:
+                            logger.info(
+                                "[sync] DECKLINK_BUFFER_RECOVERED qdepth=%d", queue_depth,
+                            )
+                            _decklink_qdepth_high[0] = False
+
+                        audio_qdepth = 0
+                        try:
+                            audio_qdepth = decklink_input.GetAvailableAudioSampleFrameCount()
+                            if audio_qdepth > 4800:  # > 100ms at 48 kHz
+                                logger.warning(
+                                    "[sync] AUDIO_QUEUE_DEPTH qdepth=%d (>100ms at 48kHz)", audio_qdepth
+                                )
                         except Exception:
                             pass
 
@@ -222,7 +275,8 @@ def _create_input_callback(
                             _diag_frames[0] += 1
                             log_video_frame(
                                 _frame_n[0], video_stream_time, hw_ref_time, hw_ref_valid,
-                                tc_str, TIMESCALE, flags, queue_depth,
+                                hw_ref_time_in_frame, tc_str, TIMESCALE, flags,
+                                queue_depth, audio_qdepth,
                             )
 
                         # Frame buffer
@@ -242,6 +296,10 @@ def _create_input_callback(
                             )
 
                         video_buffer.EndAccess(_dl.bmdBufferAccessRead)
+
+                        if stream_time_valid and video_stream_duration > 0:
+                            _last_stream_time[0] = video_stream_time
+                            _last_frame_duration[0] = video_stream_duration
 
                     except Exception as e:
                         logger.error("Error processing video frame: %s", e, exc_info=True)
@@ -325,6 +383,8 @@ class DeckLinkCapture:
         self._decklink_input = None
         self._display_name = "Unknown"
         self._callback_com = None
+        self._notification_com = None   # IDeckLinkNotificationCallback COM object
+        self._notification_if = None    # IDeckLinkNotification interface
         self._started = False
         self._shared_framerate: list = [None]   # shared with the callback closure
 
@@ -404,10 +464,50 @@ class DeckLinkCapture:
         self._started = True
         logger.info("DeckLink capture started")
 
+        self._setup_notification()
+
         threading.Thread(
             target=self._probe_format_if_needed,
             name="format-probe", daemon=True,
         ).start()
+
+    def _setup_notification(self) -> None:
+        """Subscribe to IDeckLinkNotification(bmdStatusChanged) as a supplementary signal-lock monitor.
+
+        VideoInputFormatChanged is the primary signal-change path, but some driver versions or signal
+        conditions fire bmdStatusChanged without triggering VideoInputFormatChanged. This provides a
+        second pathway to log signal lock/unlock events.
+        """
+        try:
+            from comtypes import COMObject
+
+            bmd_status_changed = getattr(_dl, 'bmdStatusChanged', 0x73746174)
+            bmd_signal_locked_id = getattr(_dl, 'bmdDeckLinkStatusVideoInputSignalLocked', 0x7669736C)
+            capture_ref = self
+
+            class _NotifyCB(COMObject):
+                _com_interfaces_ = [_dl.IDeckLinkNotificationCallback]
+
+                def Notify(self, topic, param1, param2):
+                    try:
+                        if topic == bmd_status_changed and int(param1) == bmd_signal_locked_id:
+                            locked = capture_ref.get_signal_locked()
+                            if locked is False:
+                                log_signal_loss("signal_not_locked (IDeckLinkNotification)")
+                            elif locked:
+                                logger.info("[sync] STATUS_CHANGE signal_locked=True")
+                    except Exception as e:
+                        logger.debug("Notification callback error: %s", e)
+                    return 0
+
+            cb = _NotifyCB()
+            notification = self._decklink_input.QueryInterface(_dl.IDeckLinkNotification)
+            notification.Subscribe(bmd_status_changed, cb)
+            self._notification_com = cb
+            self._notification_if = notification
+            logger.info("IDeckLinkNotification subscribed for bmdStatusChanged")
+        except Exception as e:
+            logger.debug("IDeckLinkNotification not available on this card/driver: %s", e)
 
     def _probe_format_if_needed(self) -> None:
         """Probe the current input format via IDeckLinkStatus if VideoInputFormatChanged doesn't fire within 1s.
@@ -422,6 +522,13 @@ class DeckLinkCapture:
             return
 
         logger.info("VideoInputFormatChanged not received within 1s — probing input format via IDeckLinkStatus")
+
+        # Check signal lock before probing format; log if no signal present at all
+        locked = self.get_signal_locked()
+        if locked is False:
+            log_signal_loss("signal_not_locked (startup probe — no SDI signal detected)")
+        elif locked is None:
+            logger.debug("bmdDeckLinkStatusVideoInputSignalLocked not available on this card")
 
         # Step 1: query the currently detected video input mode constant
         try:
@@ -477,6 +584,16 @@ class DeckLinkCapture:
     def stop(self) -> None:
         if not self._started:
             return
+        if self._notification_if and self._notification_com:
+            try:
+                self._notification_if.Unsubscribe(
+                    getattr(_dl, 'bmdStatusChanged', 0x73746174),
+                    self._notification_com,
+                )
+            except Exception:
+                pass
+            self._notification_if = None
+            self._notification_com = None
         try:
             self._decklink_input.StopStreams()
             self._decklink_input.DisableVideoInput()
@@ -485,6 +602,21 @@ class DeckLinkCapture:
             logger.error("Error stopping DeckLink: %s", e)
         self._started = False
         logger.info("DeckLink capture stopped")
+
+    def get_signal_locked(self) -> Optional[bool]:
+        """Query IDeckLinkStatus for signal lock state.
+
+        Returns True if locked, False if not locked, None if the query failed
+        (e.g. IDeckLinkStatus not available on this card/driver version).
+        """
+        try:
+            status = self._decklink_input.QueryInterface(_dl.IDeckLinkStatus)
+            locked = status.GetFlag(
+                getattr(_dl, 'bmdDeckLinkStatusVideoInputSignalLocked', 0x7669736C)
+            )
+            return bool(locked)
+        except Exception:
+            return None
 
     def get_status(self) -> dict:
         return {

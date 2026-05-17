@@ -182,6 +182,17 @@ class Service:
             if self._stop_event.is_set():
                 break
             self._check_disk()
+            self._check_signal_lock()
+
+    def _check_signal_lock(self) -> None:
+        if self._capture is None:
+            return
+        try:
+            locked = self._capture.get_signal_locked()
+            if locked is False:
+                log_signal_loss("signal_not_locked (periodic health check — no SDI signal)")
+        except Exception as e:
+            logger.debug("Signal lock check failed: %s", e)
 
     def _check_disk(self) -> None:
         try:
