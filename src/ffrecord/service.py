@@ -2,12 +2,12 @@
 
 Responsibilities:
   - Open the DeckLink device (COM-only).
-  - Build the deinterlace filter graph (if configured).
+  - Build the capture filter graph (if configured).
   - Start N output threads from config.
   - Fan-out incoming frames/audio to per-output bounded queues.
   - Monitor disk free space and pause/resume outputs accordingly.
   - Handle format-change callbacks from DeckLink (treat as signal-loss: close
-    all segments, reinit deinterlace, start new segments).
+    all segments, reinit filter graph, start new segments).
   - Expose status, pause/resume, and per-output enable/disable for the HTTP server.
 """
 
@@ -22,7 +22,7 @@ from typing import Optional
 
 import numpy as np
 
-from .capture.deinterlace import VideoFilter
+from .capture.input_filter import InputVideoFilter
 from .capture.decklink_com import DeckLinkCapture
 from .config import ServiceConfig, OutputConfig
 from .output.base import AudioPacket, OutputThread, VideoFrame
@@ -49,7 +49,7 @@ class Service:
         self.channel_name = config.channel.name
         self._outputs: list[OutputThread] = []
         self._capture: Optional[DeckLinkCapture] = None
-        self._video_filter: Optional[VideoFilter] = None
+        self._video_filter: Optional[InputVideoFilter] = None
         self._stop_event = threading.Event()
         self._disk_paused = False
         self._global_paused = False
@@ -112,7 +112,7 @@ class Service:
         # Lazy-init the filter on first frame — only build a graph when video_filter
         # is set. Empty video_filter ⇒ passthrough (raw uyvy422 to outputs).
         if self._video_filter is None:
-            self._video_filter = VideoFilter(
+            self._video_filter = InputVideoFilter(
                 width, height, framerate,
                 spec=cap.video_filter,
                 pix_fmt=cap.pix_fmt,

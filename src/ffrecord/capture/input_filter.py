@@ -13,9 +13,9 @@ backslash escapes (`text=hello\, world`) protect commas from the top-level
 split, so most working ffmpeg `-vf` strings can be pasted verbatim.
 
 Usage:
-    f = VideoFilter(1920, 1080, (25000, 1000),
-                    spec='yadif=mode=0:parity=auto:deint=interlaced,format=yuv420p',
-                    pix_fmt='yuv420p')
+    f = InputVideoFilter(1920, 1080, (25000, 1000),
+                         spec='yadif=mode=0:parity=auto:deint=interlaced,format=yuv420p',
+                         pix_fmt='yuv420p')
     print(f.output_framerate, f.output_pix_fmt, f.output_width, f.output_height)
     for arr in f.process(frame_bytes, w, h, row_bytes):
         consume(arr)
@@ -86,11 +86,14 @@ def _parse_filter_chain(spec: str) -> list[tuple[str, str]]:
     return out
 
 
-class VideoFilter:
-    """ffmpeg-style filter graph + passthrough mode. Single instance per channel.
+class InputVideoFilter:
+    """Channel-level ffmpeg-style filter graph + passthrough mode. Single instance per channel.
 
-    Output properties are inspected from the buffersink after `graph.configure()`,
-    falling back to source properties when the buffersink doesn't expose them.
+    Processes raw uyvy422 bytes from DeckLink. Output properties are inspected
+    from the buffersink after `graph.configure()`, falling back to source
+    properties when the buffersink doesn't expose them.
+
+    See OutputVideoFilter in output/output_filter.py for the per-output counterpart.
     """
 
     def __init__(self, width: int, height: int, framerate: tuple[int, int],
@@ -309,7 +312,3 @@ class VideoFilter:
         self._graph = None
         self._src = None
         self._sink = None
-
-
-# Backwards-compatible alias so existing imports keep working during the rename.
-Deinterlacer = VideoFilter

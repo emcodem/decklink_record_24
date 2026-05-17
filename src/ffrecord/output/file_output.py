@@ -14,6 +14,7 @@ import numpy as np
 from ..config import OutputConfig
 from . import path_template as pt
 from .base import AudioPacket, OutputThread, VideoFrame
+from .output_filter import OutputAudioFilter, OutputVideoFilter
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,8 @@ class FileOutput(OutputThread):
         container: Optional[av.container.OutputContainer] = None
         vstream = None
         astreams: list = []
+        vfilter: Optional[OutputVideoFilter] = None
+        afilter: Optional[OutputAudioFilter] = None
         # Per-segment PTS counters. Each new segment is its own MOV file with a
         # local timeline starting at 0, so PTS must reset on open — otherwise
         # segment N's video starts at pts = N×(frames_per_segment), which the MOV
@@ -161,20 +164,38 @@ class FileOutput(OutputThread):
                 if frame is None:
                     # Timeout or stop sentinel
                     if self._stop_event.is_set():
+                        self._log.info("Encoder loop exiting (stop event)")
                         break
                     continue
+
+                # Lazy-init per-output video filter on first frame.
+                if self.cfg.video_filter and vfilter is None:
+                    vfilter = OutputVideoFilter(
+                        frame.width, frame.height, frame.framerate,
+                        frame.fmt, self.cfg.video_filter,
+                    )
+
+                filtered_frames = list(vfilter.process(frame.data)) if vfilter else [frame.data]
+
+                if not filtered_frames and container is None:
+                    continue
+
+                eff_w = vfilter.output_width if vfilter else frame.width
+                eff_h = vfilter.output_height if vfilter else frame.height
+                eff_fmt = _map_fmt(vfilter.output_pix_fmt if vfilter else frame.fmt)
+                eff_framerate = vfilter.output_framerate if vfilter else frame.framerate
 
                 now_ms = int(time.time() * 1000)
 
                 if container is None:
                     segment_start_ms = now_ms
-                    open_new_segment(segment_start_ms, frame.width, frame.height, frame.framerate)
+                    open_new_segment(segment_start_ms, eff_w, eff_h, eff_framerate)
 
                 # Segment rollover by frame count — deterministic, exact duration.
                 if seg_v_pts >= frames_per_segment:
                     close_segment()
                     segment_start_ms = now_ms
-                    open_new_segment(segment_start_ms, frame.width, frame.height, frame.framerate)
+                    open_new_segment(segment_start_ms, eff_w, eff_h, eff_framerate)
 
                 # A/V alignment on format change: flush stale pre-change audio and wait for first post-change packet
                 if self._format_change_pending.is_set():
@@ -197,20 +218,21 @@ class FileOutput(OutputThread):
                     _post_format_change = False
 
                 # Encode video — pts is segment-local so each new MOV starts at 0.
-                try:
-                    av_frame = av.VideoFrame.from_ndarray(frame.data, format=_map_fmt(frame.fmt))
-                    av_frame.pts = seg_v_pts
-                    pkt_count = 0
-                    for pkt in vstream.encode(av_frame):
-                        container.mux(pkt)
-                        pkt_count += 1
-                    self.video_pkts_muxed += pkt_count
-                    if self.stats.frames_written == 0:
-                        self._log.info("First video frame encoded (produced %d packet(s))", pkt_count)
-                    seg_v_pts += 1
-                    self.stats.frames_written += 1
-                except Exception as e:
-                    self._log.error("Video encode error: %s", e, exc_info=True)
+                for arr in filtered_frames:
+                    try:
+                        av_frame = av.VideoFrame.from_ndarray(arr, format=eff_fmt)
+                        av_frame.pts = seg_v_pts
+                        pkt_count = 0
+                        for pkt in vstream.encode(av_frame):
+                            container.mux(pkt)
+                            pkt_count += 1
+                        self.video_pkts_muxed += pkt_count
+                        if self.stats.frames_written == 0:
+                            self._log.info("First video frame encoded (produced %d packet(s))", pkt_count)
+                        seg_v_pts += 1
+                        self.stats.frames_written += 1
+                    except Exception as e:
+                        self._log.error("Video encode error: %s", e, exc_info=True)
 
                 # Encode any pending audio — pts is in sample-units, segment-local.
                 for apkt in self._drain_audio():
@@ -221,54 +243,67 @@ class FileOutput(OutputThread):
                         if self.cfg.audio.downmix == "stereo":
                             audio_data = _downmix_stereo(audio_data)
 
-                        # int16 → int32 in upper bits: s32 codec treats full ±2^31 as the
-                        # audio range, so we left-shift int16 into the high bits to keep
-                        # amplitude correct. Without the shift, pcm_s24le and aac both
-                        # produce ~96 dB-below-FS silence from valid int16 input.
-                        pkt_count = 0
-                        if len(astreams) == 1:
-                            layout = "stereo" if audio_data.shape[1] == 2 else f"{audio_data.shape[1]}c"
-                            arr = (audio_data.astype(np.int32) << 16).reshape(1, -1)
-                            af = av.AudioFrame.from_ndarray(arr, format="s32", layout=layout)
-                            af.sample_rate = apkt.sample_rate
-                            af.pts = seg_a_pts_samples
-                            af.time_base = fractions.Fraction(1, apkt.sample_rate)
-                            for pkt in astreams[0].encode(af):
-                                container.mux(pkt)
-                                pkt_count += 1
-                        else:
-                            # mono_per_channel — one mono frame per stream
-                            for ch_idx, astream in enumerate(astreams):
-                                ch_data = audio_data[:, ch_idx:ch_idx + 1]
-                                arr = (ch_data.astype(np.int32) << 16).reshape(1, -1)
-                                af = av.AudioFrame.from_ndarray(arr, format="s32", layout="mono")
+                        # Lazy-init per-output audio filter on first packet.
+                        if self.cfg.audio_filter and afilter is None:
+                            afilter = OutputAudioFilter(apkt.sample_rate, audio_data.shape[1], self.cfg.audio_filter)
+
+                        chunks = list(afilter.process(audio_data)) if afilter else [audio_data]
+                        for audio_data in chunks:
+                            # int16 → int32 in upper bits: s32 codec treats full ±2^31 as the
+                            # audio range, so we left-shift int16 into the high bits to keep
+                            # amplitude correct. Without the shift, pcm_s24le and aac both
+                            # produce ~96 dB-below-FS silence from valid int16 input.
+                            pkt_count = 0
+                            if len(astreams) == 1:
+                                layout = "stereo" if audio_data.shape[1] == 2 else f"{audio_data.shape[1]}c"
+                                arr = (audio_data.astype(np.int32) << 16).reshape(1, -1)
+                                af = av.AudioFrame.from_ndarray(arr, format="s32", layout=layout)
                                 af.sample_rate = apkt.sample_rate
                                 af.pts = seg_a_pts_samples
                                 af.time_base = fractions.Fraction(1, apkt.sample_rate)
-                                for pkt in astream.encode(af):
+                                for pkt in astreams[0].encode(af):
                                     container.mux(pkt)
                                     pkt_count += 1
+                            else:
+                                # mono_per_channel — one mono frame per stream
+                                for ch_idx, astream in enumerate(astreams):
+                                    ch_data = audio_data[:, ch_idx:ch_idx + 1]
+                                    arr = (ch_data.astype(np.int32) << 16).reshape(1, -1)
+                                    af = av.AudioFrame.from_ndarray(arr, format="s32", layout="mono")
+                                    af.sample_rate = apkt.sample_rate
+                                    af.pts = seg_a_pts_samples
+                                    af.time_base = fractions.Fraction(1, apkt.sample_rate)
+                                    for pkt in astream.encode(af):
+                                        container.mux(pkt)
+                                        pkt_count += 1
 
-                        if self.audio_frames_encoded == 0:
-                            self._log.info(
-                                "First audio frame: src_ch=%d sel_ch=%d downmix=%s "
-                                "track_mode=%s streams=%d samples=%d sr=%d codec=%s",
-                                apkt.channels, audio_data.shape[1], self.cfg.audio.downmix,
-                                self.cfg.audio.track_mode, len(astreams),
-                                audio_data.shape[0], apkt.sample_rate, self.cfg.audio.codec,
-                            )
-                            self._log.info(
-                                "First audio frame encoded (produced %d packet(s))", pkt_count
-                            )
-                        self.audio_pkts_muxed += pkt_count
-                        seg_a_pts_samples += audio_data.shape[0]
-                        seg_a_frames += 1
-                        self.audio_frames_encoded += 1
+                            if self.audio_frames_encoded == 0:
+                                self._log.info(
+                                    "First audio frame: src_ch=%d sel_ch=%d downmix=%s "
+                                    "track_mode=%s streams=%d samples=%d sr=%d codec=%s",
+                                    apkt.channels, audio_data.shape[1], self.cfg.audio.downmix,
+                                    self.cfg.audio.track_mode, len(astreams),
+                                    audio_data.shape[0], apkt.sample_rate, self.cfg.audio.codec,
+                                )
+                                self._log.info(
+                                    "First audio frame encoded (produced %d packet(s))", pkt_count
+                                )
+                            self.audio_pkts_muxed += pkt_count
+                            seg_a_pts_samples += audio_data.shape[0]
+                            seg_a_frames += 1
+                            self.audio_frames_encoded += 1
                     except Exception as e:
                         self._log.error("Audio encode error: %s", e, exc_info=True)
 
         finally:
+            self._log.info("Encoder loop finally block executing")
+            if vfilter:
+                vfilter.close()
+            if afilter:
+                afilter.close()
+            self._log.info("About to close final segment")
             close_segment()
+            self._log.info("Final segment closed")
 
 
 def _parse_bitrate(s: str) -> int:

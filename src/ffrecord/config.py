@@ -36,6 +36,11 @@ class OutputConfig:
     enabled: bool = True
     # HLS-specific
     hls_list_size: int = 2
+    # Per-output filter chains (applied after the channel-level capture.video_filter).
+    # Same ffmpeg -vf / -af syntax accepted by capture.video_filter.
+    # Example: video_filter: "scale=640:-2"
+    video_filter: str = ""
+    audio_filter: str = ""
     # Sub-configs
     video: VideoEncoderConfig = field(default_factory=VideoEncoderConfig)
     audio: AudioEncoderConfig = field(default_factory=AudioEncoderConfig)
@@ -118,6 +123,8 @@ def _parse_output(d: dict) -> OutputConfig:
         segment_seconds=d.get("segment_seconds", 600),
         enabled=d.get("enabled", True),
         hls_list_size=d.get("hls_list_size", 2),
+        video_filter=d.get("video_filter", ""),
+        audio_filter=d.get("audio_filter", ""),
         video=_parse_video(d.get("video", {})),
         audio=_parse_audio(d.get("audio", {})),
     )

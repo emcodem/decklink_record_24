@@ -91,6 +91,7 @@ class OutputThread(ABC):
         self._log.info("Output thread started")
 
     def stop(self, timeout: float = 10.0) -> None:
+        self._log.info("stop() called")
         self._stop_event.set()
         # Unblock the thread if it's waiting on the queue
         try:
@@ -98,7 +99,10 @@ class OutputThread(ABC):
         except queue.Full:
             pass
         if self._thread:
+            self._log.info("Joining encoder thread with timeout=%.1fs", timeout)
             self._thread.join(timeout=timeout)
+            is_alive = self._thread.is_alive()
+            self._log.info("Encoder thread join complete, is_alive=%s", is_alive)
         if self._stats_thread:
             self._stats_thread.join(timeout=2.0)
         self._log.info("Output thread stopped (frames=%d dropped=%d segments=%d)",

@@ -69,10 +69,13 @@ outputs:
     path_template: "recording/{output}/{CH}/playlist.m3u8"
     segment_seconds: 2           # Supported: integer >= 1. HLS chunk duration.
     hls_list_size: 2             # Supported: integer >= 1. HLS-only: how many .ts segments to keep in playlist.
+    video_filter: "scale=320:-2" # Downscale to 320px width for lightweight preview encoding.
     video:
-      codec: h264_nvenc          # Supported: any ffmpeg encoder. Common: h264_nvenc, hevc_nvenc, libx264, libx265.
-      preset: p4                 # Supported (NVENC): p1 (fastest) … p7 (slowest/best quality). For libx264: ultrafast..veryslow.
-      bitrate: "4000k"           # Supported: <number>[k|M] (e.g. "4000k", "8M"). Required for lossy codecs.
+      codec: libx264             # CPU-based H.264 encoder (frees NVENC slots for hi-res archive).
+      preset: ultrafast          # Supported (libx264): ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow.
+      bitrate: "300k"            # Low bitrate suitable for 320px preview.
+      options:
+        tune: zerolatency        # Minimize encode latency for live preview.
       # pix_fmt — supported: any ffmpeg pix_fmt matching the codec/profile. Default: yuv420p.
       # profile — supported (HEVC NVENC on this machine): main, main10. (main422-10 fails — GPU limitation.)
       # Any extra PyAV codec options can be added under 'options':
@@ -86,7 +89,7 @@ outputs:
                                       #   mono_per_channel = N separate mono streams (broadcast/NLE-friendly)
                                       #   Note: ignored when downmix=stereo.
       codec: aac                      # Supported: any ffmpeg audio encoder. Common: aac, pcm_s16le, pcm_s24le.
-      bitrate: "128k"                 # Supported: <number>[k|M]. Not applicable to PCM codecs.
+      bitrate: "64k"                  # Lower bitrate for lightweight preview audio.
 
   # ── High-res archive (10-second MOV segments, all 8 audio channels) ─────────
   # Container is MOV (QuickTime). MXF was rejected by FFmpeg's muxer for HEVC

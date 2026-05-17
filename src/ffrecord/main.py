@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import signal
 import sys
+import threading
 import time
 import logging
 
@@ -76,15 +77,16 @@ def main() -> None:
                  out.name, out.type, out.enabled, out.segment_seconds)
 
     service = Service(cfg)
-    http = HttpServer(cfg.http.bind, cfg.http.port, service)
+    _shutdown_event = threading.Event()
+
+    http = HttpServer(cfg.http.bind, cfg.http.port, service, on_shutdown=lambda: _shutdown(None, None))
 
     # ── signal handlers ──────────────────────────────────────────────────────
 
     def _shutdown(signum, frame):
-        log.info("Received signal %d — shutting down...", signum)
-        service.stop()
-        http.stop()
-        sys.exit(0)
+        sig_str = f"signal {signum}" if signum is not None else "HTTP /stop"
+        log.info("Shutting down (%s)...", sig_str)
+        _shutdown_event.set()
 
     def _reload(signum, frame):
         log.info("Received SIGHUP — reloading config from %s", args.config)
@@ -96,6 +98,17 @@ def main() -> None:
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
+    # Windows console control events — only register if supported
+    if hasattr(signal, "CTRL_C_EVENT"):
+        try:
+            signal.signal(signal.CTRL_C_EVENT, _shutdown)
+        except (ValueError, RuntimeError):
+            pass
+    if hasattr(signal, "CTRL_BREAK_EVENT"):
+        try:
+            signal.signal(signal.CTRL_BREAK_EVENT, _shutdown)
+        except (ValueError, RuntimeError):
+            pass
     # SIGHUP is Unix-only; skip on Windows (Windows uses Ctrl+C → SIGINT)
     if hasattr(signal, "SIGHUP"):
         signal.signal(signal.SIGHUP, _reload)
@@ -107,8 +120,8 @@ def main() -> None:
         http.start()
         log.info("ffrecord running. HTTP status at http://%s:%d/status", cfg.http.bind, cfg.http.port)
 
-        while True:
-            time.sleep(60)
+        _shutdown_event.wait()
+        log.info("Shutdown initiated — stopping service...")
 
     except KeyboardInterrupt:
         log.info("Keyboard interrupt — shutting down...")
@@ -118,6 +131,8 @@ def main() -> None:
     finally:
         service.stop()
         http.stop()
+        for h in log.handlers:
+            h.flush()
 
 
 if __name__ == "__main__":
