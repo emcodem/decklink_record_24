@@ -69,7 +69,7 @@ class CaptureConfig:
 class ChannelConfig:
     name: str = "CH1"
     decklink_device_index: int = 0
-    expected_format: str = "1080i25"
+    expected_format: str = "bmdModeHD1080i50"
 
 
 @dataclass
@@ -143,7 +143,7 @@ def load_config(path: str | Path) -> ServiceConfig:
         channel=ChannelConfig(
             name=ch.get("name", "CH1"),
             decklink_device_index=ch.get("decklink_device_index", 0),
-            expected_format=ch.get("expected_format", "1080i25"),
+            expected_format=ch.get("expected_format", "bmdModeHD1080i50"),
         ),
         capture=CaptureConfig(
             audio_channels=cap.get("audio_channels", 8),

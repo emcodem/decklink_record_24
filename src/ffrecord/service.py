@@ -72,6 +72,7 @@ class Service:
             device_index=self.config.channel.decklink_device_index,
             audio_channels=self.config.capture.audio_channels,
             format_change_callback=self._on_format_change,
+            fallback_mode=self.config.channel.expected_format,
         )
         self._capture.start(
             frame_callback=self._on_video_frame,

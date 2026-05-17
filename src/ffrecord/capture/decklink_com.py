@@ -16,6 +16,7 @@ from __future__ import annotations
 import ctypes
 import logging
 import threading
+import time
 from typing import Callable, Optional
 
 import numpy as np
@@ -372,13 +373,15 @@ class DeckLinkCapture:
     """
 
     def __init__(self, device_index: int = 0, audio_channels: int = 8,
-                 format_change_callback: Optional[Callable] = None):
+                 format_change_callback: Optional[Callable] = None,
+                 fallback_mode: str = "bmdModeHD1080i50"):
         if not HAS_COMTYPES or not _dl:
             raise RuntimeError("comtypes and DeckLink type library are required.")
 
         self.device_index = device_index
         self.audio_channels = max(1, min(audio_channels, 16))
         self.format_change_callback = format_change_callback
+        self._fallback_mode_name = fallback_mode
 
         self._decklink_input = None
         self._display_name = "Unknown"
@@ -424,18 +427,43 @@ class DeckLinkCapture:
                 raise RuntimeError(f"hr=0x{hr:08x}")
             logger.debug("EnableVideoInput: bmdModeUnknown accepted")
         except Exception as e:
-            logger.debug("bmdModeUnknown rejected (%s) — falling back to bmdModeHD1080i50", e)
+            fallback_mode_val = getattr(_dl, self._fallback_mode_name, None)
+            if fallback_mode_val is None:
+                raise RuntimeError(
+                    f"Unknown fallback_mode '{self._fallback_mode_name}' — "
+                    "check channel.expected_format in your config"
+                )
+            logger.debug(
+                "bmdModeUnknown rejected (%s) — falling back to %s",
+                e, self._fallback_mode_name,
+            )
             try:
                 self._decklink_input.DisableVideoInput()
             except Exception:
                 pass
-            hr = self._decklink_input.EnableVideoInput(
-                _dl.bmdModeHD1080i50,
-                _dl.bmdFormat8BitYUV,
-                _dl.bmdVideoInputEnableFormatDetection,
-            )
-            if hr != 0:
-                raise RuntimeError(f"EnableVideoInput failed: {hr:#010x}")
+            _deadline = time.monotonic() + 10.0
+            _retry_interval = 0.5
+            while True:
+                try:
+                    hr = self._decklink_input.EnableVideoInput(
+                        fallback_mode_val,
+                        _dl.bmdFormat8BitYUV,
+                        _dl.bmdVideoInputEnableFormatDetection,
+                    )
+                    if hr != 0:
+                        raise RuntimeError(f"EnableVideoInput returned: {hr:#010x}")
+                    break
+                except Exception as retry_e:
+                    if time.monotonic() >= _deadline:
+                        raise RuntimeError(
+                            "EnableVideoInput failed after 10s retries "
+                            f"(device may be held by another process): {retry_e}"
+                        ) from retry_e
+                    logger.warning(
+                        "EnableVideoInput failed (%s) — device may still be releasing, retrying in %.1fs...",
+                        retry_e, _retry_interval,
+                    )
+                    time.sleep(_retry_interval)
 
         hr = self._decklink_input.EnableAudioInput(
             _dl.bmdAudioSampleRate48kHz,

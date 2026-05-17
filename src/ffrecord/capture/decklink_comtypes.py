@@ -25,16 +25,38 @@ class BMDPixelFormat:
     bmdFormat8BitBGRA = 0x61726762
 
 class BMDDisplayMode:
-    bmdModeHD1080i50 = 0x48693530
-    bmdModeHD1080i5994 = 0x48693539
-    bmdModeHD1080i6000 = 0x48693630
-    bmdModeHD1080p25 = 0x48703235
-    bmdModeHD1080p50 = 0x48703530
-    bmdModeHD1080p5994 = 0x48703539
-    bmdModeHD1080p6000 = 0x48703630
-    bmdModeHD720p50 = 0x68703530
-    bmdModeHD720p5994 = 0x68703539
-    bmdModeHD720p60 = 0x68703630
+    # SD
+    bmdModeNTSC       = 0x6E747363   # 525i59.94 (NTSC)
+    bmdModeNTSC2398   = 0x6E743233   # 525i23.98
+    bmdModePAL        = 0x70616C20   # 625i50 (PAL)
+    bmdModeNTSCp      = 0x6E747370   # 525p59.94
+    bmdModePALp       = 0x70616C70   # 625p50
+    # HD 1080 interlaced  (field rate = 2× frame rate)
+    bmdModeHD1080i50   = 0x48693530  # 1080i50  = 25 fps
+    bmdModeHD1080i5994 = 0x48693539  # 1080i59.94 = 29.97 fps
+    bmdModeHD1080i6000 = 0x48693630  # 1080i60  = 30 fps
+    # HD 1080 progressive
+    bmdModeHD1080p2398 = 0x48703233  # 1080p23.98
+    bmdModeHD1080p24   = 0x48703234  # 1080p24
+    bmdModeHD1080p25   = 0x48703235  # 1080p25
+    bmdModeHD1080p2997 = 0x48703239  # 1080p29.97
+    bmdModeHD1080p30   = 0x48703330  # 1080p30
+    bmdModeHD1080p50   = 0x48703530  # 1080p50
+    bmdModeHD1080p5994 = 0x48703539  # 1080p59.94
+    bmdModeHD1080p6000 = 0x48703630  # 1080p60
+    # HD 720 progressive
+    bmdModeHD720p50   = 0x68703530   # 720p50
+    bmdModeHD720p5994 = 0x68703539   # 720p59.94
+    bmdModeHD720p60   = 0x68703630   # 720p60
+    # 4K UHD progressive
+    bmdMode4K2160p2398 = 0x346B3233  # 2160p23.98
+    bmdMode4K2160p24   = 0x346B3234  # 2160p24
+    bmdMode4K2160p25   = 0x346B3235  # 2160p25
+    bmdMode4K2160p2997 = 0x346B3239  # 2160p29.97
+    bmdMode4K2160p30   = 0x346B3330  # 2160p30
+    bmdMode4K2160p50   = 0x346B3530  # 2160p50
+    bmdMode4K2160p5994 = 0x346B3539  # 2160p59.94
+    bmdMode4K2160p60   = 0x346B3630  # 2160p60
 
 class BMDVideoInputFlags:
     bmdVideoInputFlagDefault = 0

@@ -6,8 +6,21 @@
 channel:
   name: CH1                      # Supported: any string. Used in path templates as {CH} and in log filenames.
   decklink_device_index: 0       # Supported: integer >= 0. 0 = first DeckLink device enumerated by the SDK.
-  # expected_format is informational only; actual format comes from VideoInputFormatChanged.
-  expected_format: 1080i25       # Supported: any string. Common values: 1080i25, 1080i30, 1080p25, 1080p50, 720p50, 2160p25.
+  # expected_format: DeckLink mode name used as the fallback when the device rejects bmdModeUnknown.
+  # Format detection (VideoInputFormatChanged) will override this once a signal is seen, so this
+  # only needs to be close — but a correct value avoids mis-sized frames on initial startup.
+  # Note: DeckLink names interlaced by FIELD rate, so 25fps interlaced = bmdModeHD1080i50 (50 fields/sec).
+  # Supported values:
+  #   SD:           bmdModeNTSC  bmdModePAL  bmdModeNTSCp  bmdModePALp
+  #   1080i:        bmdModeHD1080i50  bmdModeHD1080i5994  bmdModeHD1080i6000
+  #   1080p:        bmdModeHD1080p2398  bmdModeHD1080p24  bmdModeHD1080p25
+  #                 bmdModeHD1080p2997  bmdModeHD1080p30
+  #                 bmdModeHD1080p50  bmdModeHD1080p5994  bmdModeHD1080p6000
+  #   720p:         bmdModeHD720p50  bmdModeHD720p5994  bmdModeHD720p60
+  #   4K UHD:       bmdMode4K2160p2398  bmdMode4K2160p24  bmdMode4K2160p25
+  #                 bmdMode4K2160p2997  bmdMode4K2160p30
+  #                 bmdMode4K2160p50  bmdMode4K2160p5994  bmdMode4K2160p60
+  expected_format: bmdModeHD1080i50   # 1080i50 = 25 fps interlaced (PAL/EBU standard)
 
 capture:
   audio_channels: 8              # Supported: integer 1..16. How many SDI audio channels to ingest.
