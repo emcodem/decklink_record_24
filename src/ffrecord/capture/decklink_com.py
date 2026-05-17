@@ -415,7 +415,7 @@ class DeckLinkCapture:
 
         # bmdModeUnknown tells the SDK there is no assumed format, so VideoInputFormatChanged
         # is guaranteed to fire for any live signal — even when the signal matches the old hint.
-        # Fall back to bmdModeHD1080i50 for devices that reject bmdModeUnknown.
+        # Fall back to self._fallback_mode_name (from channel.expected_format) for devices that reject bmdModeUnknown.
         _bmd_mode_unknown = getattr(_dl, 'bmdModeUnknown', 0x69756E6B)
         try:
             hr = self._decklink_input.EnableVideoInput(
