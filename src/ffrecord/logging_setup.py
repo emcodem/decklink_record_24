@@ -4,6 +4,7 @@ import logging
 import logging.handlers
 import os
 import sys
+import threading
 from pathlib import Path
 
 
@@ -35,3 +36,19 @@ def setup_logging(channel_name: str, log_dir: str, rotation_days: int, level: st
     stderr_handler = logging.StreamHandler(sys.stderr)
     stderr_handler.setFormatter(fmt)
     root.addHandler(stderr_handler)
+
+    # Route unhandled worker-thread exceptions into the log file.
+    # Without this, Python prints them only to stderr (which the supervisor
+    # discards), so crashes in capture/output threads vanish silently.
+    _thread_log = logging.getLogger("ffrecord.thread")
+
+    def _thread_excepthook(args: threading.ExceptHookArgs) -> None:
+        if args.exc_type is SystemExit:
+            return
+        _thread_log.critical(
+            "Unhandled exception in thread '%s'",
+            args.thread.name if args.thread else "<unknown>",
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    threading.excepthook = _thread_excepthook

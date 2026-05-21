@@ -52,7 +52,7 @@ class AnalyzerConfig:
     rms_window_ms: float = 2.0
     audio_channel: int = 0
     vistek_period_ms: float = 4000.0
-    colorbar_white_min: int = 242
+    colorbar_white_min: int = 200
 
 
 @dataclass
@@ -341,8 +341,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="RMS dBFS below which audio is considered silent (default: -50).")
     p.add_argument("--pixel-black-max", type=int, default=39,
                    help="Per-channel RGB max to count a pixel as black (default: 39).")
-    p.add_argument("--colorbar-white-min", type=int, default=242,
-                   help="Per-channel RGB minimum to count the centre pixel as white (default: 242, i.e. 95%% of 255).")
+    p.add_argument("--colorbar-white-min", type=int, default=200,
+                   help="Per-channel RGB minimum to count the centre pixel as white (default: 200 — works for both H.264/MOV ~255 and MJPEG/yuvj422p ~235 backgrounds).")
     p.add_argument("--sample-x", type=int, default=10,
                    help="Column to sample for the black-cross test (default: 10).")
     p.add_argument("--audio-channel", type=int, default=0,

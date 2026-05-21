@@ -109,6 +109,13 @@ class InputVideoFilter:
         self.output_height = height
         self.output_framerate: tuple[int, int] = framerate
         self.output_pix_fmt = "uyvy422"
+        # Interlace flags. input_* are seeded by the caller from DeckLink field dominance
+        # before each process() call so the filter graph has metadata to propagate.
+        # output_* are updated from pulled frames; None = passthrough (no graph ran).
+        self.input_interlaced_frame: bool = False
+        self.input_top_field_first: bool = False
+        self.output_interlaced_frame: Optional[bool] = None
+        self.output_top_field_first: Optional[bool] = None
 
         self._graph: Optional[av.filter.Graph] = None
         self._src: Optional[av.filter.FilterContext] = None
@@ -256,15 +263,28 @@ class InputVideoFilter:
         self._build_graph()
 
     def process(self, frame_bytes: bytes, width: int, height: int,
-                row_bytes: int) -> Generator[np.ndarray, None, None]:
-        """Feed one captured uyvy422 frame; yield 0 or more output frames."""
+                row_bytes: int) -> Generator[av.VideoFrame, None, None]:
+        """Feed one captured uyvy422 frame; yield 0 or more output AVFrames.
+
+        Yields PyAV VideoFrames (not numpy) so interlaced_frame/top_field_first
+        metadata set by setfield/yadif/bwdif filters survives. Downstream
+        consumers can call to_ndarray() if they need numpy. Passing the AVFrame
+        all the way to the encoder avoids needing a second per-frame setfield
+        filter, which has a thread-safety bug at full-HD in PyAV 17.0.1.
+        """
         if self._graph is None:
-            # Passthrough: yield the raw UYVY bytes repacked to numpy.
-            stride = row_bytes if row_bytes else width * 2
-            arr = np.frombuffer(frame_bytes, dtype=np.uint8)
-            if arr.size == height * stride:
-                arr = arr.reshape((height, stride))[:, :width * 2]
-            yield arr
+            # Passthrough: build a minimal AVFrame from the raw UYVY bytes.
+            av_frame = av.VideoFrame(width, height, "uyvy422")
+            plane = av_frame.planes[0]
+            input_stride = row_bytes if row_bytes else width * 2
+            if input_stride == plane.line_size and len(frame_bytes) == plane.buffer_size:
+                plane.update(frame_bytes)
+            else:
+                src_arr = np.frombuffer(frame_bytes, dtype=np.uint8).reshape((height, input_stride))
+                padded = np.zeros((height, plane.line_size), dtype=np.uint8)
+                padded[:, :width * 2] = src_arr[:, :width * 2]
+                plane.update(padded.tobytes())
+            yield av_frame
             return
 
         av_frame = av.VideoFrame(width, height, "uyvy422")
@@ -277,6 +297,11 @@ class InputVideoFilter:
             padded = np.zeros((height, plane.line_size), dtype=np.uint8)
             padded[:, :width * 2] = src_arr[:, :width * 2]
             plane.update(padded.tobytes())
+
+        # PyAV 17 makes interlaced_frame read-only, so we can't seed it on the
+        # input frame. The filter chain's setfield/yadif is the source of truth
+        # for interlaced metadata; the channel filter spec is configured to set
+        # interlaced + tff before any downstream filter consumes the frame.
 
         self._src.push(av_frame)
         while True:
@@ -306,7 +331,9 @@ class InputVideoFilter:
                     self.output_width, self.output_height, self.output_pix_fmt,
                     self.output_framerate[0], self.output_framerate[1],
                 )
-            yield out.to_ndarray(format=self.output_pix_fmt)
+            self.output_interlaced_frame = bool(getattr(out, 'interlaced_frame', self.input_interlaced_frame))
+            self.output_top_field_first = bool(getattr(out, 'top_field_first', self.input_top_field_first))
+            yield out
 
     def close(self) -> None:
         self._graph = None

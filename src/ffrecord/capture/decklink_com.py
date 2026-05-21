@@ -22,7 +22,8 @@ from typing import Callable, Optional
 import numpy as np
 
 from ..sync_log import (
-    log_audio_packet, log_av_lag, log_missed_frames, log_psf_frame,
+    log_audio_packet, log_audio_pts_overlap, log_audio_sample_gap,
+    log_av_lag, log_missed_frames, log_psf_frame,
     log_signal_loss, log_signal_return, log_video_frame,
 )
 
@@ -68,11 +69,13 @@ def _create_input_callback(
     decklink_input,
     format_change_callback: Optional[Callable] = None,
     shared_framerate: Optional[list] = None,
+    shared_field_dominance: Optional[list] = None,
 ):
     """Return a COM-backed IDeckLinkInputCallback."""
     from comtypes import COMObject
 
     _framerate = shared_framerate if shared_framerate is not None else [None]
+    _field_dominance = shared_field_dominance if shared_field_dominance is not None else [None]
     _current_mode = [None]
     _video_hw_pts_fail = [0]
     _audio_hw_pts_fail = [0]
@@ -84,6 +87,30 @@ def _create_input_callback(
     _last_stream_time = [None]   # stream_time of the most-recently-delivered frame
     _last_frame_duration = [0]   # duration (ticks) of that frame, used to predict next
     _decklink_qdepth_high = [False]   # True while driver queue depth >= threshold
+    # Startup-only audio-overflow safety net. The encoder thread's first-frame
+    # work on full-HD interlaced video stalls the COM thread for ~2 s, during
+    # which DeckLink's driver-side audio buffer (hard-capped at 48000 samples
+    # = 1 s by Blackmagic) overflows. When the COM thread resumes and we read
+    # the now-stale audio packet via audioPacket.GetBytes(), the buffer pointer
+    # is invalidated and we get an 0xC0000005 access violation.
+    #
+    # Window: first STARTUP_CALLBACK_WINDOW video callbacks. After that, if
+    # audio_qdepth ever spikes high, something else is wrong (disk stall, GC,
+    # downstream encoder stuck) and we WANT to see the warning / crash to know
+    # about it — silent dropping would mask real bugs.
+    #
+    # During the window: when audio_qdepth >= STARTUP_AUDIO_LATCH_QDEPTH, latch
+    # a "skip audio reads" flag. Stays latched until audio_qdepth drains below
+    # STARTUP_AUDIO_UNLATCH_QDEPTH (driver fully recovered). While latched, the
+    # audio packet block is skipped entirely — no GetBytes() on possibly-stale
+    # buffers.
+    _startup_callbacks_remaining = [100]  # first ~4 s of callbacks at 25 fps
+    _audio_overflow_latched = [False]
+    _audio_overflow_dropped = [0]
+    _last_audio_pts = [None]     # pts of most recently delivered audio packet
+    _last_audio_samples = [0]    # sample count of that packet (for gap computation)
+    _audio_size_last = [0]       # last seen sample_count (to detect size changes)
+    _missing_audio_pkts = [0]    # callbacks where audioPacket was absent
 
     class _CB(COMObject):
         _com_interfaces_ = [_dl.IDeckLinkInputCallback]
@@ -117,6 +144,11 @@ def _create_input_callback(
                 except Exception as e:
                     logger.error("GetFrameRate failed: %s", e)
 
+                try:
+                    _field_dominance[0] = int(newDisplayMode.GetFieldDominance())
+                except Exception as e:
+                    logger.warning("GetFieldDominance failed: %s", e)
+
                 progressive = bool(detectedSignalFlags & getattr(_dl, 'bmdDetectedVideoInputProgressive', 0x08))
                 scan = "progressive" if progressive else "interlaced"
                 fmt_str = f"{mode_name} {width}x{height} {fps_str} {scan}"
@@ -132,6 +164,9 @@ def _create_input_callback(
                 _last_stream_time[0] = None
                 _last_frame_duration[0] = 0
                 _decklink_qdepth_high[0] = False
+                _last_audio_pts[0] = None
+                _last_audio_samples[0] = 0
+                _audio_size_last[0] = 0
 
                 if decklink_input is not None and mode_constant is not None:
                     try:
@@ -162,6 +197,63 @@ def _create_input_callback(
             try:
                 if _framerate[0] is None:
                     return 0
+
+                # ── Startup-only audio-overflow safety net ───────────────────
+                # When DeckLink's driver-side audio buffer overflows (hard-capped
+                # at 48000 samples = 1 s), the videoFrame AND audioPacket COM
+                # objects passed to this callback can have stale/invalidated
+                # internal state. Touching ANY method on them — including
+                # videoFrame.GetWidth() — can dereference a freed buffer and
+                # crash with 0xC0000005.
+                #
+                # Strategy: at the top of every callback during the startup
+                # window, sample audio_qdepth (a safe API on decklink_input
+                # itself, not on the per-frame objects). If we're either above
+                # the latch threshold or already latched, return 0 immediately
+                # without touching videoFrame or audioPacket.
+                #
+                # The window is bounded by _startup_callbacks_remaining (~4 s
+                # at 25 fps). After that, we always fall through to normal
+                # processing — a mid-stream overflow surfaces as the normal
+                # warning / crash so real bugs aren't masked.
+                if _startup_callbacks_remaining[0] > 0:
+                    try:
+                        _startup_audio_qdepth = decklink_input.GetAvailableAudioSampleFrameCount()
+                    except Exception:
+                        _startup_audio_qdepth = 0
+                    _STARTUP_AUDIO_LATCH_QDEPTH = 30000     # ~625 ms
+                    _STARTUP_AUDIO_UNLATCH_QDEPTH = 1920    # one frame worth
+                    if not _audio_overflow_latched[0] and _startup_audio_qdepth >= _STARTUP_AUDIO_LATCH_QDEPTH:
+                        _audio_overflow_latched[0] = True
+                        logger.warning(
+                            "[sync] AUDIO_OVERFLOW_LATCHED audio_qdepth=%d — "
+                            "bailing out of callback (stale COM objects after driver overflow "
+                            "would crash with 0xC0000005). Will resume when buffer drains.",
+                            _startup_audio_qdepth,
+                        )
+                    elif _audio_overflow_latched[0] and _startup_audio_qdepth <= _STARTUP_AUDIO_UNLATCH_QDEPTH:
+                        _audio_overflow_latched[0] = False
+                        logger.info(
+                            "[sync] AUDIO_OVERFLOW_RECOVERED audio_qdepth=%d "
+                            "(skipped %d callbacks during startup recovery)",
+                            _startup_audio_qdepth, _audio_overflow_dropped[0],
+                        )
+                    # Always decrement the window counter so it expires even
+                    # while latched (we don't want a permanent latch).
+                    _startup_callbacks_remaining[0] -= 1
+                    if _audio_overflow_latched[0]:
+                        _audio_overflow_dropped[0] += 1
+                        return 0
+                elif _audio_overflow_latched[0]:
+                    # Startup window expired while latched — clear it and let
+                    # any subsequent overflow surface normally (we want to know
+                    # about mid-stream stalls; silent dropping would mask bugs).
+                    _audio_overflow_latched[0] = False
+                    logger.warning(
+                        "[sync] AUDIO_OVERFLOW_LATCH_EXPIRED startup window ended "
+                        "with %d callbacks skipped. Subsequent overflows surface normally.",
+                        _audio_overflow_dropped[0],
+                    )
 
                 if videoFrame and frame_callback:
                     try:
@@ -280,23 +372,36 @@ def _create_input_callback(
                                 queue_depth, audio_qdepth,
                             )
 
-                        # Frame buffer
-                        video_buffer = videoFrame.QueryInterface(_dl.IDeckLinkVideoBuffer)
-                        video_buffer.StartAccess(_dl.bmdBufferAccessRead)
-                        buffer_ptr = video_buffer.GetBytes()
-
-                        if buffer_ptr:
-                            data_size = height * row_bytes
-                            frame_data = (ctypes.c_uint8 * data_size).from_address(buffer_ptr)
-                            frame_bytes = bytes(frame_data)
-                            frame_callback(
-                                frame_bytes, width, height, pixel_format, _framerate[0],
-                                flags, row_bytes,
-                                video_stream_time, TIMESCALE, stream_time_valid,
-                                hw_ref_time, hw_ref_valid, tc_str,
+                        # Drop the frame without touching the buffer when the DeckLink ring
+                        # buffer is critically full.  Accessing the frame data while the
+                        # driver is overflowing causes a native crash.  This can happen
+                        # during startup while the frame-processor thread holds the GIL
+                        # initialising its libav filter graph.  Dropping a few frames here
+                        # is far better than crashing.
+                        _DECKLINK_CRITICAL_QDEPTH = 8
+                        if queue_depth >= _DECKLINK_CRITICAL_QDEPTH:
+                            logger.warning(
+                                "[sync] FRAME_DROPPED qdepth=%d (>=%d) — skipping frame to drain buffer",
+                                queue_depth, _DECKLINK_CRITICAL_QDEPTH,
                             )
+                        else:
+                            # Frame buffer
+                            video_buffer = videoFrame.QueryInterface(_dl.IDeckLinkVideoBuffer)
+                            video_buffer.StartAccess(_dl.bmdBufferAccessRead)
+                            buffer_ptr = video_buffer.GetBytes()
 
-                        video_buffer.EndAccess(_dl.bmdBufferAccessRead)
+                            if buffer_ptr:
+                                data_size = height * row_bytes
+                                frame_data = (ctypes.c_uint8 * data_size).from_address(buffer_ptr)
+                                frame_bytes = bytes(frame_data)
+                                frame_callback(
+                                    frame_bytes, width, height, pixel_format, _framerate[0],
+                                    flags, row_bytes,
+                                    video_stream_time, TIMESCALE, stream_time_valid,
+                                    hw_ref_time, hw_ref_valid, tc_str,
+                                )
+
+                            video_buffer.EndAccess(_dl.bmdBufferAccessRead)
 
                         if stream_time_valid and video_stream_duration > 0:
                             _last_stream_time[0] = video_stream_time
@@ -324,12 +429,53 @@ def _create_input_callback(
                                            "GetPacketTime failed", e)
 
                         _audio_n[0] += 1
+
+                        # Audio pts continuity — detect gaps (missing samples) and overlaps.
+                        # Tolerance is 2 samples to absorb integer-division rounding in our
+                        # expected_pts calculation (DeckLink hardware pts itself is accurate).
+                        if audio_pts_valid:
+                            if _last_audio_pts[0] is not None and _last_audio_samples[0] > 0:
+                                expected_pts = (
+                                    _last_audio_pts[0]
+                                    + _last_audio_samples[0] * TIMESCALE // 48000
+                                )
+                                gap_ticks = audio_pts - expected_pts
+                                tol_ticks = 2 * TIMESCALE // 48000
+                                if gap_ticks > tol_ticks:
+                                    gap_samples = round(gap_ticks * 48000 / TIMESCALE)
+                                    log_audio_sample_gap(
+                                        _audio_n[0], gap_samples, gap_ticks,
+                                        _last_audio_pts[0], audio_pts, TIMESCALE,
+                                    )
+                                elif gap_ticks < -tol_ticks:
+                                    log_audio_pts_overlap(
+                                        _audio_n[0], gap_ticks,
+                                        _last_audio_pts[0], audio_pts, TIMESCALE,
+                                    )
+                            _last_audio_pts[0] = audio_pts
+                            _last_audio_samples[0] = sample_count
+
+                        # Log packet size changes after the initial burst to catch
+                        # irregular delivery (e.g. size drift at fractional framerates).
+                        if (_audio_size_last[0] != 0
+                                and sample_count != _audio_size_last[0]
+                                and _diag_audio[0] >= _DIAG_BURST):
+                            logger.info(
+                                "[sync] AUDIO_SIZE_CHANGE pkt_n=%d old=%d new=%d",
+                                _audio_n[0], _audio_size_last[0], sample_count,
+                            )
+                        _audio_size_last[0] = sample_count
+
                         if _diag_audio[0] < _DIAG_BURST:
                             _diag_audio[0] += 1
                             log_audio_packet(
                                 _audio_n[0], audio_pts, hw_ref_audio, hw_ref_audio_valid,
                                 TIMESCALE, sample_count,
                             )
+                            if audio_pts_valid and _last_stream_time[0] is not None:
+                                log_av_lag(
+                                    _audio_n[0], _last_stream_time[0], audio_pts, TIMESCALE,
+                                )
 
                         if buffer_ptr and sample_count > 0:
                             data_size = sample_count * audio_channels * 2
@@ -344,6 +490,15 @@ def _create_input_callback(
 
                     except Exception as e:
                         logger.error("Error processing audio packet: %s", e, exc_info=True)
+
+                elif audio_callback:
+                    # audioPacket absent on this video frame arrival — audio delivery skipped.
+                    _missing_audio_pkts[0] += 1
+                    _log_graduated(
+                        "ffrecord.capture", _missing_audio_pkts[0],
+                        "audioPacket absent in VideoInputFrameArrived",
+                        Exception(f"frame_n={_frame_n[0]} total_absent={_missing_audio_pkts[0]}"),
+                    )
 
             except Exception as e:
                 logger.error("Error in VideoInputFrameArrived: %s", e, exc_info=True)
@@ -390,6 +545,7 @@ class DeckLinkCapture:
         self._notification_if = None    # IDeckLinkNotification interface
         self._started = False
         self._shared_framerate: list = [None]   # shared with the callback closure
+        self._shared_field_dominance: list = [None]  # BMDFieldDominance from current display mode
 
         self._frame_callback: Optional[Callable] = None
         self._audio_callback: Optional[Callable] = None
@@ -404,6 +560,16 @@ class DeckLinkCapture:
     @property
     def display_name(self) -> str:
         return self._display_name
+
+    @property
+    def field_dominance(self) -> Optional[int]:
+        """BMDFieldDominance FourCC from the current display mode, or None if unknown.
+        0x75707072 'uppr' = bmdUpperFieldFirst (TFF),
+        0x6C6F7772 'lowr' = bmdLowerFieldFirst (BFF),
+        0x70726F67 'prog' = bmdProgressiveFrame,
+        0x70736620 'psf ' = bmdProgressiveSegmentedFrame.
+        """
+        return self._shared_field_dominance[0]
 
     def start(self, frame_callback: Callable, audio_callback: Callable) -> None:
         if self._started:
@@ -476,10 +642,12 @@ class DeckLinkCapture:
             logger.info("Audio input enabled (%d channels)", self.audio_channels)
 
         self._shared_framerate[0] = None  # reset in case of restart
+        self._shared_field_dominance[0] = None
         self._callback_com = _create_input_callback(
             frame_callback, audio_callback, self.audio_channels,
             self._decklink_input, self.format_change_callback,
             shared_framerate=self._shared_framerate,
+            shared_field_dominance=self._shared_field_dominance,
         )
         hr = self._decklink_input.SetCallback(self._callback_com)
         if hr != 0:
@@ -595,6 +763,10 @@ class DeckLinkCapture:
                     raw = dm.GetFrameRate()
                     fps_num, fps_den = int(raw[1]), int(raw[0])
                     self._shared_framerate[0] = (fps_num, fps_den)
+                    try:
+                        self._shared_field_dominance[0] = int(dm.GetFieldDominance())
+                    except Exception:
+                        pass
                     logger.info("Probed input format: '%s' fps=%d/%d — frames will now flow", mode_name, fps_num, fps_den)
                     if self.format_change_callback:
                         try:

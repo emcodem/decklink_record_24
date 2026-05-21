@@ -39,15 +39,21 @@ class OutputVideoFilter:
     """
 
     def __init__(self, width: int, height: int, framerate: tuple[int, int],
-                 pix_fmt: str, spec: str):
+                 pix_fmt: str, spec: str,
+                 input_interlaced: bool = False, input_top_field_first: bool = True):
         self._spec = spec.strip()
         self.input_width = width
         self.input_height = height
         self.input_pix_fmt = pix_fmt
+        self.input_interlaced = input_interlaced
+        self.input_top_field_first = input_top_field_first
         self.output_width = width
         self.output_height = height
         self.output_framerate = framerate
         self.output_pix_fmt = pix_fmt
+        # Observed from probe — see _probe_output().
+        self.output_interlaced = input_interlaced
+        self.output_top_field_first = input_top_field_first
 
         self._graph: Optional[av.filter.Graph] = None
         self._src: Optional[av.filter.FilterContext] = None
@@ -63,10 +69,13 @@ class OutputVideoFilter:
         # encoder to be initialised at the wrong resolution.
         self._probe_output(framerate)
         logger.info(
-            "Output video filter '%s': %dx%d %s @ %d/%d → %dx%d %s @ %d/%d",
+            "Output video filter '%s': %dx%d %s @ %d/%d (interlaced=%s tff=%s) "
+            "→ %dx%d %s @ %d/%d (interlaced=%s tff=%s)",
             self._spec, width, height, pix_fmt, framerate[0], framerate[1],
+            self.input_interlaced, self.input_top_field_first,
             self.output_width, self.output_height, self.output_pix_fmt,
             self.output_framerate[0], self.output_framerate[1],
+            self.output_interlaced, self.output_top_field_first,
         )
 
     def _build_graph(self, width: int, height: int,
@@ -129,31 +138,43 @@ class OutputVideoFilter:
             pass
 
     def _probe_output(self, input_framerate: tuple[int, int]) -> None:
-        """Push blank test frames to determine real output dimensions and framerate.
+        """Push test frames to learn output geometry, framerate, AND interlacing.
 
-        buffersink can report framerate metadata after graph.configure() but does
-        not expose output width/height until frames have been pulled. Pushing test
-        frames and reading the first pulled frame's geometry is the only reliable
-        way. The graph is rebuilt afterwards so real encoding starts clean.
+        buffersink reports framerate metadata after graph.configure() but exposes
+        no geometry until frames have been pulled. For interlacing we go one step
+        further: rebuild a probe-only graph that injects setfield at the front so
+        the user's filter chain sees test frames marked exactly like real capture
+        will be. Whatever the chain produces — passthrough, deinterlace, or its
+        own setfield — we read back the interlaced_frame/top_field_first of the
+        pulled frame and store it. The encoder loop uses those observed flags to
+        decide whether to apply its own setfield before encoding.
         """
         if self._src is None or self._sink is None:
             return
+        probe_graph, probe_src, probe_sink = self._build_probe_graph(
+            self.input_width, self.input_height, input_framerate, self.input_pix_fmt,
+            self.input_interlaced, self.input_top_field_first,
+        )
         probe_count = 8
         frames_out = 0
         saved_framerate = self.output_framerate
+        observed_interlaced: Optional[bool] = None
+        observed_tff: Optional[bool] = None
         for i in range(probe_count):
             test = av.VideoFrame(self.input_width, self.input_height, self.input_pix_fmt)
             test.pts = i
-            self._src.push(test)
+            probe_src.push(test)
             while True:
                 try:
-                    out = self._sink.pull()
+                    out = probe_sink.pull()
                     if frames_out == 0:
                         self.output_width = int(out.width)
                         self.output_height = int(out.height)
                         fmt_name = getattr(out.format, "name", None) if out.format else None
                         if fmt_name:
                             self.output_pix_fmt = fmt_name
+                        observed_interlaced = bool(getattr(out, "interlaced_frame", False))
+                        observed_tff = bool(getattr(out, "top_field_first", True))
                     frames_out += 1
                 except av.BlockingIOError:
                     break
@@ -163,13 +184,60 @@ class OutputVideoFilter:
             ratio = frames_out / probe_count
             fps_num, fps_den = input_framerate
             self.output_framerate = (round(fps_num * ratio), fps_den)
+        if observed_interlaced is not None:
+            self.output_interlaced = observed_interlaced
+            self.output_top_field_first = observed_tff if observed_tff is not None else True
         logger.info(
-            "Probed output: %d frames in → %d out | size %dx%d %s @ %d/%d",
+            "Probed output: %d frames in → %d out | size %dx%d %s @ %d/%d | "
+            "input(interlaced=%s tff=%s) → output(interlaced=%s tff=%s)",
             probe_count, frames_out,
             self.output_width, self.output_height, self.output_pix_fmt,
             self.output_framerate[0], self.output_framerate[1],
+            self.input_interlaced, self.input_top_field_first,
+            self.output_interlaced, self.output_top_field_first,
         )
         self._build_graph(self.input_width, self.input_height, input_framerate, self.input_pix_fmt)
+
+    def _build_probe_graph(
+        self, width: int, height: int, framerate: tuple[int, int],
+        pix_fmt: str, interlaced: bool, top_field_first: bool,
+    ):
+        """Build a probe-only graph that pre-marks frames with the real input's
+        interlace flags before they enter the user's filter chain.
+
+        Test frames created by av.VideoFrame(...) are progressive with no
+        interlaced_frame/top_field_first set. Without setfield at the front,
+        yadif sees progressive input and is a no-op; a passthrough chain
+        would also report progressive output. Neither reflects what happens
+        with real DeckLink frames. Injecting setfield reproduces the real
+        pipeline exactly during probing.
+        """
+        graph = av.filter.Graph()
+        fps_num, fps_den = framerate
+        pix_fmt_av = av.video.format.VideoFormat(pix_fmt).name
+        src = graph.add("buffer",
+            f"video_size={width}x{height}:"
+            f"pix_fmt={pix_fmt_av}:"
+            f"time_base={fps_den}/{fps_num}:"
+            f"frame_rate={fps_num}/{fps_den}:"
+            f"pixel_aspect=1/1"
+        )
+        sink = graph.add("buffersink")
+
+        chain = _parse_filter_chain(self._spec)
+        if not chain or chain[-1][0] != "format":
+            chain.append(("format", pix_fmt))
+        if interlaced:
+            chain.insert(0, ("setfield", "tff" if top_field_first else "bff"))
+
+        prev = src
+        for name, args in chain:
+            node = graph.add(name, args) if args else graph.add(name)
+            prev.link_to(node)
+            prev = node
+        prev.link_to(sink)
+        graph.configure()
+        return graph, src, sink
 
     def process(self, arr: np.ndarray) -> Generator[np.ndarray, None, None]:
         av_frame = av.VideoFrame.from_ndarray(arr, format=self.input_pix_fmt)
