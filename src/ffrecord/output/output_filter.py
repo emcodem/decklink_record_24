@@ -157,9 +157,9 @@ class OutputVideoFilter:
         )
         probe_count = 8
         frames_out = 0
-        saved_framerate = self.output_framerate
         observed_interlaced: Optional[bool] = None
         observed_tff: Optional[bool] = None
+        observed_time_base = None
         for i in range(probe_count):
             test = av.VideoFrame(self.input_width, self.input_height, self.input_pix_fmt)
             test.pts = i
@@ -175,15 +175,27 @@ class OutputVideoFilter:
                             self.output_pix_fmt = fmt_name
                         observed_interlaced = bool(getattr(out, "interlaced_frame", False))
                         observed_tff = bool(getattr(out, "top_field_first", True))
+                        observed_time_base = getattr(out, "time_base", None)
                     frames_out += 1
                 except av.BlockingIOError:
                     break
-        # Update framerate from probe only when _query_sink() did not already
-        # determine a different rate (i.e. it is still equal to the input rate).
-        if saved_framerate == input_framerate and frames_out > 0 and frames_out != probe_count:
-            ratio = frames_out / probe_count
-            fps_num, fps_den = input_framerate
-            self.output_framerate = (round(fps_num * ratio), fps_den)
+        # Each output frame's time_base is the filter chain's output frame
+        # duration — libav sets it to 1/output_fps for every chain we care
+        # about (passthrough, scale, yadif, fps, and any combination). So
+        # frame_rate = 1 / time_base, i.e. (denominator, numerator).
+        # This is the authoritative signal: it ignores startup transients
+        # (yadif buffers 1 frame, so an 8-frame probe ratio would round to
+        # 22 fps for a chain that definitively outputs 25) and works without
+        # parsing the filter spec text. PyAV 17's buffersink doesn't expose
+        # frame_rate / time_base attributes on the FilterContext itself, so
+        # reading them off a pulled frame is the supported path.
+        if (observed_time_base is not None
+                and getattr(observed_time_base, "numerator", 0)
+                and getattr(observed_time_base, "denominator", 0)):
+            self.output_framerate = (
+                int(observed_time_base.denominator),
+                int(observed_time_base.numerator),
+            )
         if observed_interlaced is not None:
             self.output_interlaced = observed_interlaced
             self.output_top_field_first = observed_tff if observed_tff is not None else True
