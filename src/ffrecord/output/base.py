@@ -23,7 +23,8 @@ from typing import Optional
 import numpy as np
 
 from ..encoding_buffer import EncodingBuffer
-from ..sync_log import log_dropped_frame
+from ..sync_log import log_dropped_frame, log_encoder_persistent_crash, log_join_timeout
+from .util import MuxCounters
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,7 @@ class OutputStats:
     enabled: bool = True
     paused: bool = False
     synthesized_audio_frames: int = 0   # AVPair.audio_is_synthesized=True count
+    mux_failures: int = 0               # total container.mux() failures (B2)
 
 
 # ── base class ─────────────────────────────────────────────────────────────
@@ -110,7 +112,15 @@ class OutputThread(ABC):
     arrive when the queue is full are counted as drops.
     """
 
-    RESTART_DELAY = 2.0   # seconds between encoder restart attempts
+    # Exponential backoff for encoder restarts. The encoder always keeps trying
+    # (broadcast = best-effort, never give up), but the gap between attempts
+    # widens so a persistently-broken codec doesn't burn 100% CPU spinning.
+    RESTART_DELAY_INITIAL = 2.0
+    RESTART_DELAY_MAX = 60.0
+    # Window in which N+ restarts trigger a single PERSISTENT_CRASH ERROR line
+    # so the operator sees the recurring failure clearly above WARNING noise.
+    PERSISTENT_CRASH_WINDOW_S = 300.0
+    PERSISTENT_CRASH_THRESHOLD = 5
     STATS_INTERVAL = 5.0  # seconds between [stats] heartbeat lines
 
     def __init__(self, name: str, channel_name: str, segment_seconds: int):
@@ -121,6 +131,8 @@ class OutputThread(ABC):
         self.video_pkts_muxed = 0    # incremented by subclasses after container.mux()
         self.audio_pkts_muxed = 0
         self.audio_frames_encoded = 0   # number of AudioFrames sent through astream.encode()
+        # B2: mux failure counters. EncoderOutput passes this to util.mux_with_logging().
+        self.mux_counters = MuxCounters()
 
         self._pair_buffer: EncodingBuffer[AVPair] = EncodingBuffer(
             name=f"{channel_name}/{name}", capacity=DEFAULT_QUEUE_CAPACITY,
@@ -131,6 +143,19 @@ class OutputThread(ABC):
         self._stop_event = threading.Event()
         self._format_change_pending = threading.Event()
         self._log = logging.getLogger(f"ffrecord.output.{name}")
+
+    def prewarm_codec(
+        self,
+        enc_w: int,
+        enc_h: int,
+        enc_fr: tuple,
+        enc_pix_fmt: str,
+    ) -> None:
+        """Optional hook: open the container + codec early so DeckLink isn't
+        blocked by avcodec_open2() on the first real frame. Default is a no-op
+        for output classes that don't need it.
+        """
+        return None
 
     # ── public API (called from capture/pairing thread) ──────────────────────
 
@@ -153,15 +178,21 @@ class OutputThread(ABC):
         if self._thread:
             self._log.info("Joining encoder thread with timeout=%.1fs", timeout)
             self._thread.join(timeout=timeout)
-            is_alive = self._thread.is_alive()
-            self._log.info("Encoder thread join complete, is_alive=%s", is_alive)
+            if self._thread.is_alive():
+                log_join_timeout(f"output-{self.name}", timeout)
+                self._log.warning("Encoder thread did not exit within %.1fs", timeout)
+            else:
+                self._log.info("Encoder thread joined cleanly")
         if self._stats_thread:
             self._stats_thread.join(timeout=2.0)
+            if self._stats_thread.is_alive():
+                log_join_timeout(f"stats-{self.name}", 2.0)
         self._log.info(
             "Output thread stopped (frames=%d dropped=%d segments=%d "
-            "synthesized_audio=%d)",
+            "synthesized_audio=%d mux_failures=%d)",
             self.stats.frames_written, self.stats.frames_dropped,
             self.stats.segments_completed, self.stats.synthesized_audio_frames,
+            self.stats.mux_failures,
         )
 
     def push_pair(self, pair: AVPair) -> None:
@@ -234,16 +265,56 @@ class OutputThread(ABC):
     # ── internal run loop ────────────────────────────────────────────────────
 
     def _run(self) -> None:
+        # B3: exponential backoff between restart attempts and a single ERROR
+        # line per persistent-crash episode (>= PERSISTENT_CRASH_THRESHOLD
+        # restarts within PERSISTENT_CRASH_WINDOW_S).
+        next_delay = self.RESTART_DELAY_INITIAL
+        recent_restart_times: list[float] = []
+        persistent_crash_logged = False
+
         while not self._stop_event.is_set():
             try:
                 self._encoder_loop()
             except Exception as e:
+                now = time.monotonic()
                 self.stats.encoder_restarts += 1
                 self.stats.last_error = str(e)
-                self._log.error("Encoder crashed (restart #%d): %s", self.stats.encoder_restarts, e, exc_info=True)
+                self._log.error(
+                    "Encoder crashed (restart #%d, next retry in %.1fs): %s",
+                    self.stats.encoder_restarts, next_delay, e, exc_info=True,
+                )
+
+                # Slide the restart-time window. If the count inside the window
+                # crosses the threshold, log ONE PERSISTENT_CRASH line; reset
+                # the flag once the rate calms down so a later relapse logs
+                # again.
+                cutoff = now - self.PERSISTENT_CRASH_WINDOW_S
+                recent_restart_times = [t for t in recent_restart_times if t >= cutoff]
+                recent_restart_times.append(now)
+                if len(recent_restart_times) >= self.PERSISTENT_CRASH_THRESHOLD:
+                    if not persistent_crash_logged:
+                        log_encoder_persistent_crash(
+                            self.name, self.stats.encoder_restarts,
+                            self.PERSISTENT_CRASH_WINDOW_S, str(e),
+                        )
+                        persistent_crash_logged = True
+                else:
+                    persistent_crash_logged = False
+
                 if not self._stop_event.is_set():
-                    time.sleep(self.RESTART_DELAY)
+                    # Wait via the stop event so a shutdown during backoff
+                    # exits promptly instead of dragging the full delay.
+                    if self._stop_event.wait(timeout=next_delay):
+                        break
                     self._log.info("Restarting encoder...")
+                    next_delay = min(next_delay * 2.0, self.RESTART_DELAY_MAX)
+            else:
+                # Encoder loop returned cleanly (no exception). Reset the
+                # backoff so an isolated future crash doesn't inherit a long
+                # delay from a previous storm.
+                next_delay = self.RESTART_DELAY_INITIAL
+                recent_restart_times.clear()
+                persistent_crash_logged = False
 
     # ── consumer API for subclass encoder loops ──────────────────────────────
 

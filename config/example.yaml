@@ -74,61 +74,62 @@ logging:
   level: INFO                    # Supported: DEBUG | INFO | WARNING | ERROR
 
 outputs:
-  # ── HLS live preview (low-latency, rolling 2-chunk window) ──────────────────
-  - name: hls_preview            # Supported: any unique string identifier.
-    type: hls                    # Supported: hls | file
-    enabled: true                # Supported: true | false
+  # All outputs use the same EncoderOutput class. The container_format string
+  # selects the libav muxer; container_options are passed straight to it.
+  # internal_splitter.enabled = true → app closes+reopens the container every N
+  # seconds of frames so each file is independently playable (use for archive).
+  # internal_splitter.enabled = false (default) → libav handles any sub-
+  # segmentation via its own options (use for HLS / DASH / mpegts).
+
+  # ── HLS live preview (libav-managed, rolling 2-chunk window) ────────────────
+  - name: hls_preview
+    enabled: true
     # path_template — placeholders: {output}, {CH}, {YYYYMMDDHH}, {starttime_unix_ms}, {seq}
     path_template: "recording/{output}/{CH}/playlist.m3u8"
-    segment_seconds: 2           # Supported: integer >= 1. HLS chunk duration.
-    hls_list_size: 2             # Supported: integer >= 1. HLS-only: how many .ts segments to keep in playlist.
-    video_filter: "scale=320:-2" # Downscale to 320px width for lightweight preview encoding.
+    container_format: hls
+    container_options:
+      hls_time: "2"
+      hls_list_size: "2"
+      hls_flags: "delete_segments+append_list"
+      hls_segment_type: "mpegts"
+    internal_splitter:
+      enabled: false             # libav's HLS muxer slices internally
+    video_filter: "scale=320:-2"
     video:
-      codec: libx264             # CPU-based H.264 encoder (frees NVENC slots for hi-res archive).
-      preset: ultrafast          # Supported (libx264): ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow.
-      bitrate: "300k"            # Low bitrate suitable for 320px preview.
+      codec: libx264
+      preset: ultrafast
+      bitrate: "300k"
+      gop: "seconds:2"           # Force GOP = 2s × fps for HLS keyframe alignment.
       options:
-        tune: zerolatency        # Minimize encode latency for live preview.
-      # pix_fmt — supported: any ffmpeg pix_fmt matching the codec/profile. Default: yuv420p.
-      # profile — supported (HEVC NVENC on this machine): main, main10. (main422-10 fails — GPU limitation.)
-      # Any extra PyAV codec options can be added under 'options':
-      # options:
-      #   rc: cbr                # ffmpeg codec option key:value pairs passed through
+        tune: zerolatency
     audio:
-      channels: [1, 2]                # Supported: list of 1-based SDI channel indices in 1..16.
-      downmix: stereo                 # Supported: stereo | none
-      track_mode: combined            # Supported: combined | mono_per_channel
-                                      #   combined         = one stream with N channels (legacy/default)
-                                      #   mono_per_channel = N separate mono streams (broadcast/NLE-friendly)
-                                      #   Note: ignored when downmix=stereo.
-      codec: aac                      # Supported: any ffmpeg audio encoder. Common: aac, pcm_s16le, pcm_s24le.
-      bitrate: "64k"                  # Lower bitrate for lightweight preview audio.
+      channels: [1, 2]
+      downmix: stereo
+      track_mode: combined       # HLS only supports combined; validation will reject mono_per_channel.
+      codec: aac
+      bitrate: "64k"
 
-  # ── High-res archive (10-second MOV segments, all 8 audio channels) ─────────
-  # Container is MOV (QuickTime). MXF was rejected by FFmpeg's muxer for HEVC
-  # essence ("Operation not permitted" / AVERROR(EPERM)). MOV accepts HEVC,
-  # H.264, ProRes, etc., and supports multi-channel PCM audio.
+  # ── High-res archive (app-managed 10s MOV segments) ────────────────────────
   - name: archive
-    type: file                   # Supported: file (segmented MOV/MP4) | hls
     enabled: true
-    # {YYYYMMDDHH} = UTC hour directory, {starttime_unix_ms} = segment start timestamp
     path_template: "recording/{output}/{CH}/{YYYYMMDDHH}/{starttime_unix_ms}.mov"
-    segment_seconds: 10          # Supported: integer >= 1. Exact duration in video frames (deterministic).
+    container_format: mov
+    container_options: {}        # e.g. movflags: faststart (rarely needed for archive)
+    internal_splitter:
+      enabled: true              # close+reopen container per segment
+      seconds: 10                # exact duration in frames (deterministic)
     video:
-      codec: hevc_nvenc          # Supported: hevc_nvenc, h264_nvenc, libx264, libx265, prores_ks, etc.
-      profile: main10            # Supported (hevc_nvenc on this GPU): main, main10. (main422-10 fails.)
-      pix_fmt: p010le            # Supported: yuv420p (main), p010le (main10), yuv422p10le (main422-10 only).
-      preset: p7                 # Supported (NVENC): p1..p7.
-      bitrate: "50M"             # Supported: <number>[k|M].
-      # For 4:2:2 10-bit (main422-10 profile) change pix_fmt to yuv422p10le
-      # and note it requires Turing+ (RTX 20xx) or newer NVENC hardware.
+      codec: hevc_nvenc
+      profile: main10
+      pix_fmt: p010le
+      preset: p7
+      bitrate: "50M"
+      gop: auto
     audio:
-      channels: [1, 2, 3, 4, 5, 6, 7, 8]   # Supported: list of 1-based SDI channel indices in 1..16.
-      downmix: none                        # Supported: stereo | none
-      track_mode: mono_per_channel         # Supported: combined | mono_per_channel
-                                           # 8 separate mono tracks (broadcast/NLE-friendly).
-      codec: pcm_s24le                     # Supported: pcm_s16le, pcm_s24le, pcm_s32le, aac.
-      # bitrate not applicable for PCM
+      channels: [1, 2, 3, 4, 5, 6, 7, 8]
+      downmix: none
+      track_mode: mono_per_channel   # 8 separate mono streams (broadcast/NLE-friendly)
+      codec: pcm_s24le
 
   # ── Proxy MP4 (same source, lighter bitrate for NLE import) ─────────────────
   # - name: proxy_mp4

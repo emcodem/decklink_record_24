@@ -22,8 +22,8 @@ from typing import Callable, Optional
 import numpy as np
 
 from ..sync_log import (
-    log_audio_packet, log_audio_pts_overlap, log_audio_sample_gap,
-    log_av_lag, log_missed_frames, log_psf_frame,
+    log_audio_overflow_summary, log_audio_packet, log_audio_pts_overlap,
+    log_audio_sample_gap, log_av_lag, log_missed_frames, log_psf_frame,
     log_signal_loss, log_signal_return, log_video_frame,
 )
 
@@ -70,6 +70,8 @@ def _create_input_callback(
     format_change_callback: Optional[Callable] = None,
     shared_framerate: Optional[list] = None,
     shared_field_dominance: Optional[list] = None,
+    shared_audio_overflow_dropped: Optional[list] = None,
+    shared_last_callback_monotonic: Optional[list] = None,
 ):
     """Return a COM-backed IDeckLinkInputCallback."""
     from comtypes import COMObject
@@ -106,7 +108,16 @@ def _create_input_callback(
     # buffers.
     _startup_callbacks_remaining = [100]  # first ~4 s of callbacks at 25 fps
     _audio_overflow_latched = [False]
-    _audio_overflow_dropped = [0]
+    # Bound to the DeckLinkCapture-level shared counter so /status can read it.
+    _audio_overflow_dropped = (
+        shared_audio_overflow_dropped if shared_audio_overflow_dropped is not None else [0]
+    )
+    _startup_summary_logged = [False]
+    # Monotonic timestamp of the most recent callback — shared with the Service
+    # heartbeat for the frame-arrival watchdog (L1/L2).
+    _last_callback_monotonic = (
+        shared_last_callback_monotonic if shared_last_callback_monotonic is not None else [0.0]
+    )
     _last_audio_pts = [None]     # pts of most recently delivered audio packet
     _last_audio_samples = [0]    # sample count of that packet (for gap computation)
     _audio_size_last = [0]       # last seen sample_count (to detect size changes)
@@ -195,6 +206,11 @@ def _create_input_callback(
 
         def VideoInputFrameArrived(self, videoFrame, audioPacket):
             try:
+                # Record arrival time for the Service-level frame-arrival watchdog.
+                # Updated at the top of every callback even when we bail out early,
+                # so a latched startup overflow does not look like a frame stall.
+                _last_callback_monotonic[0] = time.monotonic()
+
                 if _framerate[0] is None:
                     return 0
 
@@ -244,16 +260,24 @@ def _create_input_callback(
                     if _audio_overflow_latched[0]:
                         _audio_overflow_dropped[0] += 1
                         return 0
-                elif _audio_overflow_latched[0]:
-                    # Startup window expired while latched — clear it and let
-                    # any subsequent overflow surface normally (we want to know
-                    # about mid-stream stalls; silent dropping would mask bugs).
-                    _audio_overflow_latched[0] = False
-                    logger.warning(
-                        "[sync] AUDIO_OVERFLOW_LATCH_EXPIRED startup window ended "
-                        "with %d callbacks skipped. Subsequent overflows surface normally.",
-                        _audio_overflow_dropped[0],
-                    )
+                else:
+                    # Window has just expired. Log a summary line exactly once so
+                    # operators see the dropped-callback count even when it's 0 —
+                    # a clean "0 callbacks skipped" line confirms a healthy
+                    # startup, distinguishing "no problem" from "no log at all".
+                    if not _startup_summary_logged[0]:
+                        _startup_summary_logged[0] = True
+                        log_audio_overflow_summary(_audio_overflow_dropped[0])
+                    if _audio_overflow_latched[0]:
+                        # Startup window expired while latched — clear it and let
+                        # any subsequent overflow surface normally (we want to know
+                        # about mid-stream stalls; silent dropping would mask bugs).
+                        _audio_overflow_latched[0] = False
+                        logger.warning(
+                            "[sync] AUDIO_OVERFLOW_LATCH_EXPIRED startup window ended "
+                            "with %d callbacks skipped. Subsequent overflows surface normally.",
+                            _audio_overflow_dropped[0],
+                        )
 
                 if videoFrame and frame_callback:
                     try:
@@ -385,23 +409,33 @@ def _create_input_callback(
                                 queue_depth, _DECKLINK_CRITICAL_QDEPTH,
                             )
                         else:
-                            # Frame buffer
+                            # Frame buffer.  StartAccess MUST be paired with EndAccess via
+                            # try/finally — otherwise an exception in frame_callback or the
+                            # ctypes.from_address path leaks the COM buffer lock and the
+                            # driver eventually starves.
                             video_buffer = videoFrame.QueryInterface(_dl.IDeckLinkVideoBuffer)
                             video_buffer.StartAccess(_dl.bmdBufferAccessRead)
-                            buffer_ptr = video_buffer.GetBytes()
+                            try:
+                                buffer_ptr = video_buffer.GetBytes()
 
-                            if buffer_ptr:
-                                data_size = height * row_bytes
-                                frame_data = (ctypes.c_uint8 * data_size).from_address(buffer_ptr)
-                                frame_bytes = bytes(frame_data)
-                                frame_callback(
-                                    frame_bytes, width, height, pixel_format, _framerate[0],
-                                    flags, row_bytes,
-                                    video_stream_time, TIMESCALE, stream_time_valid,
-                                    hw_ref_time, hw_ref_valid, tc_str,
-                                )
-
-                            video_buffer.EndAccess(_dl.bmdBufferAccessRead)
+                                if buffer_ptr:
+                                    data_size = height * row_bytes
+                                    frame_data = (ctypes.c_uint8 * data_size).from_address(buffer_ptr)
+                                    frame_bytes = bytes(frame_data)
+                                    frame_callback(
+                                        frame_bytes, width, height, pixel_format, _framerate[0],
+                                        flags, row_bytes,
+                                        video_stream_time, TIMESCALE, stream_time_valid,
+                                        hw_ref_time, hw_ref_valid, tc_str,
+                                    )
+                            finally:
+                                try:
+                                    video_buffer.EndAccess(_dl.bmdBufferAccessRead)
+                                except Exception as end_e:
+                                    logger.warning(
+                                        "EndAccess failed on frame %d: %s",
+                                        _frame_n[0], end_e,
+                                    )
 
                         if stream_time_valid and video_stream_duration > 0:
                             _last_stream_time[0] = video_stream_time
@@ -544,6 +578,16 @@ class DeckLinkCapture:
         self._notification_com = None   # IDeckLinkNotificationCallback COM object
         self._notification_if = None    # IDeckLinkNotification interface
         self._started = False
+        # Guards start()/stop() so concurrent callers (HTTP /stop racing with SIGINT,
+        # signal handler racing with shutdown thread) cannot double-initialise or
+        # double-tear-down the COM device. Held across the entire start/stop body so
+        # stop() blocks until any in-progress start() completes.
+        self._lifecycle_lock = threading.Lock()
+        # Single-element lists shared with the COM callback closure so the Service
+        # heartbeat (L1) and /status endpoint (B8) can read these without traversing
+        # the closure or holding a lock.
+        self._shared_audio_overflow_dropped: list = [0]
+        self._shared_last_callback_monotonic: list = [0.0]
         self._shared_framerate: list = [None]   # shared with the callback closure
         self._shared_field_dominance: list = [None]  # BMDFieldDominance from current display mode
 
@@ -572,93 +616,96 @@ class DeckLinkCapture:
         return self._shared_field_dominance[0]
 
     def start(self, frame_callback: Callable, audio_callback: Callable) -> None:
-        if self._started:
-            logger.warning("Already started")
-            return
+        with self._lifecycle_lock:
+            if self._started:
+                logger.warning("Already started")
+                return
 
-        self._frame_callback = frame_callback
-        self._audio_callback = audio_callback
+            self._frame_callback = frame_callback
+            self._audio_callback = audio_callback
 
-        # bmdModeUnknown tells the SDK there is no assumed format, so VideoInputFormatChanged
-        # is guaranteed to fire for any live signal — even when the signal matches the old hint.
-        # Fall back to self._fallback_mode_name (from channel.expected_format) for devices that reject bmdModeUnknown.
-        _bmd_mode_unknown = getattr(_dl, 'bmdModeUnknown', 0x69756E6B)
-        try:
-            hr = self._decklink_input.EnableVideoInput(
-                _bmd_mode_unknown,
-                _dl.bmdFormat8BitYUV,
-                _dl.bmdVideoInputEnableFormatDetection,
+            # bmdModeUnknown tells the SDK there is no assumed format, so VideoInputFormatChanged
+            # is guaranteed to fire for any live signal — even when the signal matches the old hint.
+            # Fall back to self._fallback_mode_name (from channel.expected_format) for devices that reject bmdModeUnknown.
+            _bmd_mode_unknown = getattr(_dl, 'bmdModeUnknown', 0x69756E6B)
+            try:
+                hr = self._decklink_input.EnableVideoInput(
+                    _bmd_mode_unknown,
+                    _dl.bmdFormat8BitYUV,
+                    _dl.bmdVideoInputEnableFormatDetection,
+                )
+                if hr != 0:
+                    raise RuntimeError(f"hr=0x{hr:08x}")
+                logger.debug("EnableVideoInput: bmdModeUnknown accepted")
+            except Exception as e:
+                fallback_mode_val = getattr(_dl, self._fallback_mode_name, None)
+                if fallback_mode_val is None:
+                    raise RuntimeError(
+                        f"Unknown fallback_mode '{self._fallback_mode_name}' — "
+                        "check channel.expected_format in your config"
+                    )
+                logger.debug(
+                    "bmdModeUnknown rejected (%s) — falling back to %s",
+                    e, self._fallback_mode_name,
+                )
+                try:
+                    self._decklink_input.DisableVideoInput()
+                except Exception:
+                    pass
+                _deadline = time.monotonic() + 10.0
+                _retry_interval = 0.5
+                while True:
+                    try:
+                        hr = self._decklink_input.EnableVideoInput(
+                            fallback_mode_val,
+                            _dl.bmdFormat8BitYUV,
+                            _dl.bmdVideoInputEnableFormatDetection,
+                        )
+                        if hr != 0:
+                            raise RuntimeError(f"EnableVideoInput returned: {hr:#010x}")
+                        break
+                    except Exception as retry_e:
+                        if time.monotonic() >= _deadline:
+                            raise RuntimeError(
+                                "EnableVideoInput failed after 10s retries "
+                                f"(device may be held by another process): {retry_e}"
+                            ) from retry_e
+                        logger.warning(
+                            "EnableVideoInput failed (%s) — device may still be releasing, retrying in %.1fs...",
+                            retry_e, _retry_interval,
+                        )
+                        time.sleep(_retry_interval)
+
+            hr = self._decklink_input.EnableAudioInput(
+                _dl.bmdAudioSampleRate48kHz,
+                _dl.bmdAudioSampleType16bitInteger,
+                self.audio_channels,
             )
             if hr != 0:
-                raise RuntimeError(f"hr=0x{hr:08x}")
-            logger.debug("EnableVideoInput: bmdModeUnknown accepted")
-        except Exception as e:
-            fallback_mode_val = getattr(_dl, self._fallback_mode_name, None)
-            if fallback_mode_val is None:
-                raise RuntimeError(
-                    f"Unknown fallback_mode '{self._fallback_mode_name}' — "
-                    "check channel.expected_format in your config"
-                )
-            logger.debug(
-                "bmdModeUnknown rejected (%s) — falling back to %s",
-                e, self._fallback_mode_name,
+                logger.warning("EnableAudioInput failed: %s", hr)
+            else:
+                logger.info("Audio input enabled (%d channels)", self.audio_channels)
+
+            self._shared_framerate[0] = None  # reset in case of restart
+            self._shared_field_dominance[0] = None
+            self._callback_com = _create_input_callback(
+                frame_callback, audio_callback, self.audio_channels,
+                self._decklink_input, self.format_change_callback,
+                shared_framerate=self._shared_framerate,
+                shared_field_dominance=self._shared_field_dominance,
+                shared_audio_overflow_dropped=self._shared_audio_overflow_dropped,
+                shared_last_callback_monotonic=self._shared_last_callback_monotonic,
             )
-            try:
-                self._decklink_input.DisableVideoInput()
-            except Exception:
-                pass
-            _deadline = time.monotonic() + 10.0
-            _retry_interval = 0.5
-            while True:
-                try:
-                    hr = self._decklink_input.EnableVideoInput(
-                        fallback_mode_val,
-                        _dl.bmdFormat8BitYUV,
-                        _dl.bmdVideoInputEnableFormatDetection,
-                    )
-                    if hr != 0:
-                        raise RuntimeError(f"EnableVideoInput returned: {hr:#010x}")
-                    break
-                except Exception as retry_e:
-                    if time.monotonic() >= _deadline:
-                        raise RuntimeError(
-                            "EnableVideoInput failed after 10s retries "
-                            f"(device may be held by another process): {retry_e}"
-                        ) from retry_e
-                    logger.warning(
-                        "EnableVideoInput failed (%s) — device may still be releasing, retrying in %.1fs...",
-                        retry_e, _retry_interval,
-                    )
-                    time.sleep(_retry_interval)
+            hr = self._decklink_input.SetCallback(self._callback_com)
+            if hr != 0:
+                logger.warning("SetCallback failed: %s", hr)
 
-        hr = self._decklink_input.EnableAudioInput(
-            _dl.bmdAudioSampleRate48kHz,
-            _dl.bmdAudioSampleType16bitInteger,
-            self.audio_channels,
-        )
-        if hr != 0:
-            logger.warning("EnableAudioInput failed: %s", hr)
-        else:
-            logger.info("Audio input enabled (%d channels)", self.audio_channels)
+            hr = self._decklink_input.StartStreams()
+            if hr != 0:
+                raise RuntimeError(f"StartStreams failed: {hr:#010x}")
 
-        self._shared_framerate[0] = None  # reset in case of restart
-        self._shared_field_dominance[0] = None
-        self._callback_com = _create_input_callback(
-            frame_callback, audio_callback, self.audio_channels,
-            self._decklink_input, self.format_change_callback,
-            shared_framerate=self._shared_framerate,
-            shared_field_dominance=self._shared_field_dominance,
-        )
-        hr = self._decklink_input.SetCallback(self._callback_com)
-        if hr != 0:
-            logger.warning("SetCallback failed: %s", hr)
-
-        hr = self._decklink_input.StartStreams()
-        if hr != 0:
-            raise RuntimeError(f"StartStreams failed: {hr:#010x}")
-
-        self._started = True
-        logger.info("DeckLink capture started")
+            self._started = True
+            logger.info("DeckLink capture started")
 
         self._setup_notification()
 
@@ -782,26 +829,27 @@ class DeckLinkCapture:
             logger.warning("Display mode enumeration failed: %s", e)
 
     def stop(self) -> None:
-        if not self._started:
-            return
-        if self._notification_if and self._notification_com:
+        with self._lifecycle_lock:
+            if not self._started:
+                return
+            if self._notification_if and self._notification_com:
+                try:
+                    self._notification_if.Unsubscribe(
+                        getattr(_dl, 'bmdStatusChanged', 0x73746174),
+                        self._notification_com,
+                    )
+                except Exception as e:
+                    logger.warning("Notification unsubscribe failed: %s", e)
+                self._notification_if = None
+                self._notification_com = None
             try:
-                self._notification_if.Unsubscribe(
-                    getattr(_dl, 'bmdStatusChanged', 0x73746174),
-                    self._notification_com,
-                )
-            except Exception:
-                pass
-            self._notification_if = None
-            self._notification_com = None
-        try:
-            self._decklink_input.StopStreams()
-            self._decklink_input.DisableVideoInput()
-            self._decklink_input.DisableAudioInput()
-        except Exception as e:
-            logger.error("Error stopping DeckLink: %s", e)
-        self._started = False
-        logger.info("DeckLink capture stopped")
+                self._decklink_input.StopStreams()
+                self._decklink_input.DisableVideoInput()
+                self._decklink_input.DisableAudioInput()
+            except Exception as e:
+                logger.error("Error stopping DeckLink: %s", e)
+            self._started = False
+            logger.info("DeckLink capture stopped")
 
     def get_signal_locked(self) -> Optional[bool]:
         """Query IDeckLinkStatus for signal lock state.
@@ -819,9 +867,27 @@ class DeckLinkCapture:
             return None
 
     def get_status(self) -> dict:
+        last_cb = self._shared_last_callback_monotonic[0]
+        callback_age_s = (time.monotonic() - last_cb) if last_cb > 0 else None
         return {
             "device": self._display_name,
             "device_index": self.device_index,
             "started": self._started,
             "audio_channels": self.audio_channels,
+            "audio_overflow_dropped_callbacks": self._shared_audio_overflow_dropped[0],
+            "last_callback_age_s": callback_age_s,
         }
+
+    @property
+    def last_callback_monotonic(self) -> float:
+        """Monotonic timestamp of the most recent DeckLink callback.
+
+        Used by the Service-level heartbeat / frame-arrival watchdog (L1/L2).
+        Returns 0.0 before the first callback fires.
+        """
+        return self._shared_last_callback_monotonic[0]
+
+    @property
+    def audio_overflow_dropped(self) -> int:
+        """Total callbacks skipped by the startup audio-overflow latch."""
+        return self._shared_audio_overflow_dropped[0]

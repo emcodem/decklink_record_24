@@ -53,5 +53,10 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
+# Capture output (per-run artifacts; never tracked)
+recording/
+recording_test/
+logs/
+
 # Except vendor/ — custom PyAV wheel + FFmpeg DLLs are tracked
 !vendor/

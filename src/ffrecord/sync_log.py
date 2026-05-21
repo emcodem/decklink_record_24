@@ -233,3 +233,108 @@ def log_encoding_buffer_recovered(output_name: str, qsize: int, qmax: int) -> No
         "[enc_buf] RECOVERED output=%s qsize=%d/%d",
         output_name, qsize, qmax,
     )
+
+
+# ── Mux / encoder failures ─────────────────────────────────────────────────
+
+def log_mux_failure(output_name: str, reason: str, total_failures: int) -> None:
+    """libav container.mux() raised. Caller MUST keep the encoder going."""
+    _sync.warning(
+        "[mux] FAILED output=%s total=%d reason=%s",
+        output_name, total_failures, reason,
+    )
+
+
+def log_encoder_persistent_crash(
+    output_name: str,
+    restart_count: int,
+    window_seconds: float,
+    last_error: str,
+) -> None:
+    """Encoder has crashed repeatedly inside a sliding window — escalate to ERROR.
+
+    Logged ONCE per persistent-crash episode. The encoder loop keeps retrying
+    in the background; this line just makes the recurring failure obvious to
+    the operator without spamming the log every restart.
+    """
+    _sync.error(
+        "[encoder] PERSISTENT_CRASH output=%s restarts=%d window=%.0fs last_error=%s",
+        output_name, restart_count, window_seconds, last_error,
+    )
+
+
+# ── Per-output filter dropouts ─────────────────────────────────────────────
+
+def log_filter_dropout(output_name: str, total_dropouts: int) -> None:
+    """Per-output filter graph yielded zero frames for an incoming pair.
+
+    Graduated: caller logs only on counts 1, 10, 100, 1000, 10000.
+    """
+    _sync.warning(
+        "[filter] DROPOUT output=%s total=%d (filter returned no frames)",
+        output_name, total_dropouts,
+    )
+
+
+# ── Service-level / capture-level diagnostics ──────────────────────────────
+
+def log_channel_heartbeat(payload: dict) -> None:
+    """Periodic Service-level health snapshot.
+
+    Pass a dict; one structured INFO line is emitted. Keep keys short and
+    flat so a grep '[channel] HEARTBEAT' line stays readable.
+    """
+    _sync.info(
+        "[channel] HEARTBEAT %s",
+        " ".join(f"{k}={v}" for k, v in payload.items()),
+    )
+
+
+def log_frame_arrival_stall(age_s: float, frame_duration_s: float) -> None:
+    """No DeckLink callback in N× frame duration despite signal_locked=True."""
+    _sync.warning(
+        "[capture] FRAME_ARRIVAL_STALL age=%.2fs (>%.2fs threshold)",
+        age_s, frame_duration_s * 3,
+    )
+
+
+def log_frame_arrival_recovered(stall_duration_s: float) -> None:
+    """Callbacks resumed after a stall."""
+    _sync.info(
+        "[capture] FRAME_ARRIVAL_RECOVERED after_stall=%.2fs",
+        stall_duration_s,
+    )
+
+
+def log_audio_overflow_summary(dropped_callbacks: int) -> None:
+    """End of the startup audio-overflow safety window. Always logged once
+    (even when dropped_callbacks=0) so operators can confirm a healthy startup.
+    """
+    _sync.info(
+        "[sync] AUDIO_OVERFLOW_STARTUP_SUMMARY dropped_callbacks=%d (window=100 callbacks)",
+        dropped_callbacks,
+    )
+
+
+# ── Lifecycle ──────────────────────────────────────────────────────────────
+
+def log_join_timeout(thread_name: str, timeout_s: float) -> None:
+    """A join(timeout=...) returned with the thread still alive."""
+    _sync.warning(
+        "[lifecycle] JOIN_TIMEOUT thread=%s timeout=%.1fs (thread still running)",
+        thread_name, timeout_s,
+    )
+
+
+def log_lifecycle_event(event: str, **fields) -> None:
+    """Generic lifecycle state-change marker.
+
+    Examples:
+        log_lifecycle_event("DISK_PAUSE_ENGAGED", free_gb=4.2, threshold_gb=5)
+        log_lifecycle_event("OUTPUT_ENABLED", name="archive")
+    """
+    payload = " ".join(f"{k}={v}" for k, v in fields.items())
+    _sync.info(
+        "[lifecycle] %s %s",
+        event, payload,
+    )

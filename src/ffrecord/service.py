@@ -30,16 +30,24 @@ from .capture.decklink_com import DeckLinkCapture
 from .capture_buffer import CaptureBuffer
 from .config import ServiceConfig, OutputConfig
 from .output.base import AudioPacket, AVPair, OutputThread, VideoFrame
-from .output.file_output import FileOutput
-from .output.hls_output import HlsOutput
+from .output.encoder import EncoderOutput
 from .output.output_filter import OutputVideoFilter
-from .sync_log import log_signal_loss
+from .sync_log import (
+    log_channel_heartbeat, log_frame_arrival_recovered, log_frame_arrival_stall,
+    log_join_timeout, log_lifecycle_event, log_signal_loss,
+)
 
 logger = logging.getLogger("ffrecord.service")
 
 DISK_CHECK_INTERVAL = 30.0     # seconds between free-space checks
 DISK_PAUSE_THRESHOLD_GB = 5.0  # pause writes below this free space
 DISK_RESUME_THRESHOLD_GB = 10.0
+
+CHANNEL_HEARTBEAT_INTERVAL = 5.0
+# Multiplier applied to expected frame duration; if no DeckLink callback has
+# arrived in (FRAME_STALL_FACTOR × frame_duration) seconds AND the device
+# reports signal_locked=True, the heartbeat fires FRAME_ARRIVAL_STALL.
+FRAME_STALL_FACTOR = 3.0
 
 # BMDFieldDominance FourCC values (DeckLink SDK uses 4-byte ASCII codes, not small integers)
 _BMD_UPPER_FIELD_FIRST = 0x75707072  # 'uppr' — TFF
@@ -94,9 +102,7 @@ _FORMAT_CHANGE_TAG = "_format_change"
 
 
 def _build_output(cfg: OutputConfig, channel_name: str) -> OutputThread:
-    if cfg.type == "hls":
-        return HlsOutput(cfg, channel_name)
-    return FileOutput(cfg, channel_name)
+    return EncoderOutput(cfg, channel_name)
 
 
 class Service:
@@ -127,6 +133,19 @@ class Service:
         # instead, in a dedicated thread.
         self._raw_video_queue: _queue_module.Queue = _queue_module.Queue()
         self._video_processor_thread: Optional[threading.Thread] = None
+
+        # Heartbeat / watchdog state. _raw_video_queue_peak resets each heartbeat
+        # so operators see the worst-case backpressure of the last interval, not
+        # of the whole session. _frame_stall_latched prevents the watchdog from
+        # logging the same stall every heartbeat — it logs once on entry and
+        # once on recovery.
+        self._heartbeat_thread: Optional[threading.Thread] = None
+        self._raw_video_queue_peak: int = 0
+        self._frame_stall_latched: bool = False
+        self._frame_stall_started_at: float = 0.0
+        # Cache of the most recent format string for the heartbeat. Updated by
+        # _on_format_change.
+        self._current_format: Optional[str] = None
 
     def _prewarm_input_filter(self) -> None:
         """Build the libav filter graph before opening the DeckLink device.
@@ -226,92 +245,6 @@ class Service:
 
         return filter_outputs
 
-    def _prewarm_encoders(self, filter_outputs: dict[str, tuple]) -> None:
-        """Encode dummy frames with each output video codec before DeckLink starts.
-
-        h264_nvenc creates a CUDA context on its first avcodec_open2() call, holding
-        the GIL for ~2 seconds. mpeg2video and other codecs have similar one-time load
-        overhead. Running dummy encodes here — with the EXACT production parameters
-        (resolution, framerate, pix_fmt, preset, options) — eliminates these spikes from
-        the live capture path. Using mismatched parameters (e.g. 256x256 vs 640x360)
-        leaves the GIL spike in place because NVENC creates a new session per configuration.
-        """
-        import fractions
-        import os
-        import tempfile
-
-        codecs_done: set[str] = set()
-        for out_cfg in self.config.outputs:
-            if not out_cfg.enabled:
-                continue
-            # HLS outputs keep their NVENC session alive via prewarm_codec().
-            # A temp-container pre-warm would close and destroy the session.
-            if out_cfg.type == "hls":
-                continue
-            codec_name = out_cfg.video.codec
-            if codec_name in codecs_done:
-                continue
-            codecs_done.add(codec_name)
-
-            dims = filter_outputs.get(
-                out_cfg.name,
-                (256, 256, (25000, 1000), "yuv420p", False, True),
-            )
-            enc_w, enc_h, enc_fr = dims[0], dims[1], dims[2]
-            enc_pix_fmt = out_cfg.video.pix_fmt
-            fps_num, fps_den = enc_fr
-            rate = fractions.Fraction(fps_num, fps_den)
-
-            logger.info(
-                "Pre-warming codec '%s' at %dx%d %s @ %d/%d (output '%s') ...",
-                codec_name, enc_w, enc_h, enc_pix_fmt, fps_num, fps_den, out_cfg.name,
-            )
-            tmp_path = None
-            try:
-                with tempfile.NamedTemporaryFile(suffix=".ts", delete=False) as f:
-                    tmp_path = f.name
-                container = av.open(tmp_path, "w", format="mpegts")
-                stream = container.add_stream(codec_name, rate=rate)
-                stream.codec_context.width = enc_w
-                stream.codec_context.height = enc_h
-                stream.codec_context.pix_fmt = enc_pix_fmt
-                # Apply the real codec options so avcodec_open2 sees identical config
-                vcfg = out_cfg.video
-                if vcfg.preset:
-                    stream.codec_context.options["preset"] = vcfg.preset
-                if vcfg.options:
-                    stream.codec_context.options.update(
-                        {k: str(v) for k, v in vcfg.options.items()}
-                    )
-                if vcfg.bitrate:
-                    try:
-                        mul = {"k": 1_000, "m": 1_000_000, "g": 1_000_000_000}
-                        s = vcfg.bitrate.strip()
-                        stream.bit_rate = int(float(s[:-1]) * mul[s[-1].lower()]) if s[-1].isalpha() else int(s)
-                    except Exception:
-                        pass
-                # Encode a few frames — NVENC needs pipeline fill before latency stabilises
-                for pts in range(3):
-                    frame = av.VideoFrame(enc_w, enc_h, enc_pix_fmt)
-                    frame.pts = pts
-                    for pkt in stream.encode(frame):
-                        container.mux(pkt)
-                for pkt in stream.encode(None):
-                    container.mux(pkt)
-                container.close()
-                logger.info("Codec '%s' pre-warmed.", codec_name)
-            except Exception as exc:
-                logger.warning(
-                    "Codec pre-warm failed for '%s' (%s) — first encode may cause GIL spike",
-                    codec_name, exc,
-                )
-            finally:
-                if tmp_path:
-                    try:
-                        os.unlink(tmp_path)
-                    except Exception:
-                        pass
-
     def start(self) -> None:
         logger.info("Service starting for channel %s", self.channel_name)
 
@@ -332,20 +265,12 @@ class Service:
         # For HLS outputs: open the real playlist container and prime the encoder.
         # The pre-warmed container is kept alive and adopted by _encoder_loop() on the
         # first pair — the NVENC session is never destroyed between pre-warm and use.
+        # OutputThread.prewarm_codec() is a no-op by default; EncoderOutput overrides.
         for out in self._outputs:
-            if isinstance(out, (HlsOutput, FileOutput)):
-                dims = filter_outputs.get(out.cfg.name)
-                if dims is not None:
-                    enc_w, enc_h, enc_fr, enc_pix_fmt = dims[0], dims[1], dims[2], dims[3]
-                    out.prewarm_codec(enc_w, enc_h, enc_fr, enc_pix_fmt)
-
-        # _prewarm_encoders() previously ran a temp-container pre-warm for
-        # non-HLS codecs to load libav codec libraries process-wide. With every
-        # output now running its own real-container pre-warm above, that step
-        # is redundant — and worse, for mpeg2video it would close the codec
-        # context FileOutput.prewarm_codec() just opened, undoing the fix.
-        # Keeping it skipped; library loading happens once during the real
-        # pre-warm and stays loaded for the lifetime of the process.
+            dims = filter_outputs.get(getattr(out, "cfg", None) and out.cfg.name)
+            if dims is not None:
+                enc_w, enc_h, enc_fr, enc_pix_fmt = dims[0], dims[1], dims[2], dims[3]
+                out.prewarm_codec(enc_w, enc_h, enc_fr, enc_pix_fmt)
 
         # Start the frame processor before opening the DeckLink device so the
         # thread is ready to drain frames the moment the first callback fires.
@@ -370,6 +295,11 @@ class Service:
         disk_thread = threading.Thread(target=self._disk_monitor_loop, name="disk-monitor", daemon=True)
         disk_thread.start()
 
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop, name="channel-heartbeat", daemon=True,
+        )
+        self._heartbeat_thread.start()
+
         logger.info("Service started (%d outputs)", len(self._outputs))
 
     def stop(self) -> None:
@@ -384,10 +314,18 @@ class Service:
         if self._video_processor_thread is not None:
             self._raw_video_queue.put(_STOP_SENTINEL)
             self._video_processor_thread.join(timeout=10)
+            if self._video_processor_thread.is_alive():
+                log_join_timeout("video-processor", 10.0)
             self._video_processor_thread = None
 
         for out in self._outputs:
             out.stop()
+
+        if self._heartbeat_thread is not None:
+            self._heartbeat_thread.join(timeout=CHANNEL_HEARTBEAT_INTERVAL + 1.0)
+            if self._heartbeat_thread.is_alive():
+                log_join_timeout("channel-heartbeat", CHANNEL_HEARTBEAT_INTERVAL + 1.0)
+            self._heartbeat_thread = None
 
         if self._video_filter:
             self._video_filter.close()
@@ -403,10 +341,11 @@ class Service:
         """Queue raw frame for off-thread processing. Returns immediately."""
         if self._global_paused or self._disk_paused:
             return
-        if self._raw_video_queue.qsize() >= _MAX_RAW_QUEUE:
+        qsize_now = self._raw_video_queue.qsize()
+        if qsize_now >= _MAX_RAW_QUEUE:
             logger.warning(
                 "Video processor queue full (%d frames) — dropping frame stream_time=%d",
-                self._raw_video_queue.qsize(), stream_time,
+                qsize_now, stream_time,
             )
             return
         self._raw_video_queue.put_nowait((
@@ -414,6 +353,9 @@ class Service:
             flags, row_bytes, stream_time, timescale, stream_time_valid,
             hw_ref_time, hw_ref_valid, tc_str,
         ))
+        # +1 to count the frame we just enqueued before the processor pops it.
+        if qsize_now + 1 > self._raw_video_queue_peak:
+            self._raw_video_queue_peak = qsize_now + 1
 
     def _on_audio_packet(self, audio_arr: np.ndarray, sample_rate: int, channels: int,
                          hw_pts: int, timescale: int, hw_pts_valid: bool) -> None:
@@ -432,12 +374,17 @@ class Service:
     def _on_format_change(self, new_format: str) -> None:
         """COM callback — log immediately, then queue a sentinel so the processor
         handles filter/buffer reset in frame order (after all pre-change frames)."""
+        log_lifecycle_event(
+            "FORMAT_CHANGE_BEGIN",
+            old=self._last_format, new=new_format,
+        )
         logger.warning(
             "Format change detected: %s → %s. Treating as signal-loss: resetting filter graph.",
             self._last_format, new_format,
         )
         log_signal_loss(f"format_change old={self._last_format} new={new_format}")
         self._last_format = new_format
+        self._current_format = new_format
         self._raw_video_queue.put_nowait((_FORMAT_CHANGE_TAG, new_format))
 
     # ── off-thread frame processing ──────────────────────────────────────────
@@ -605,6 +552,85 @@ class Service:
             self._check_disk()
             self._check_signal_lock()
 
+    # ── heartbeat / frame-arrival watchdog ───────────────────────────────────
+
+    def _expected_frame_duration_s(self) -> float:
+        """Frame duration in seconds, derived from the current capture format.
+
+        Falls back to channel.expected_format when no format-change has arrived
+        yet (so the watchdog has a sensible threshold during startup).
+        """
+        fmt = self._current_format or self.config.channel.expected_format
+        try:
+            _, _, (num, den) = _parse_bmd_format(fmt)
+            if num > 0 and den > 0:
+                return den / num
+        except Exception:
+            pass
+        return 1.0 / 25.0  # last-resort default
+
+    def _heartbeat_loop(self) -> None:
+        """Emit a structured health snapshot every CHANNEL_HEARTBEAT_INTERVAL
+        seconds and run the frame-arrival watchdog.
+
+        Single thread serves both jobs to keep the side-channel cost low — one
+        sleep, one read of shared monotonic timestamps, no locks.
+        """
+        while not self._stop_event.is_set():
+            if self._stop_event.wait(timeout=CHANNEL_HEARTBEAT_INTERVAL):
+                break
+
+            now = time.monotonic()
+            cap_stats = self._capture_buffer.get_stats()
+            last_cb = self._capture.last_callback_monotonic if self._capture else 0.0
+            callback_age = (now - last_cb) if last_cb > 0 else None
+            signal_locked = None
+            if self._capture is not None:
+                try:
+                    signal_locked = self._capture.get_signal_locked()
+                except Exception:
+                    signal_locked = None
+
+            # Watchdog: frames stopped arriving despite a locked signal.
+            frame_duration = self._expected_frame_duration_s()
+            stall_threshold = FRAME_STALL_FACTOR * frame_duration
+            if (
+                callback_age is not None
+                and callback_age > stall_threshold
+                and signal_locked is True
+            ):
+                if not self._frame_stall_latched:
+                    self._frame_stall_latched = True
+                    self._frame_stall_started_at = last_cb
+                    log_frame_arrival_stall(callback_age, frame_duration)
+            elif self._frame_stall_latched and callback_age is not None and callback_age <= stall_threshold:
+                stall_duration = (last_cb - self._frame_stall_started_at)
+                self._frame_stall_latched = False
+                log_frame_arrival_recovered(stall_duration)
+
+            queue_peak = self._raw_video_queue_peak
+            self._raw_video_queue_peak = self._raw_video_queue.qsize()
+            audio_overflow = (
+                self._capture.audio_overflow_dropped if self._capture else 0
+            )
+
+            log_channel_heartbeat({
+                "pending_v": cap_stats.pending_video,
+                "pending_a": cap_stats.pending_audio,
+                "buf_bytes": cap_stats.buffered_video_bytes,
+                "emitted": cap_stats.emitted_total,
+                "stale_drops": cap_stats.stale_audio_drops,
+                "rawq": self._raw_video_queue.qsize(),
+                "rawq_peak": queue_peak,
+                "cb_age_s": f"{callback_age:.2f}" if callback_age is not None else "n/a",
+                "signal_locked": signal_locked,
+                "format": self._current_format or "unknown",
+                "audio_overflow": audio_overflow,
+                "disk_paused": self._disk_paused,
+                "global_paused": self._global_paused,
+                "stall_latched": self._frame_stall_latched,
+            })
+
     def _check_signal_lock(self) -> None:
         if self._capture is None:
             return
@@ -621,12 +647,22 @@ class Service:
             free_gb = usage.free / (1024 ** 3)
             if not self._disk_paused and free_gb < DISK_PAUSE_THRESHOLD_GB:
                 self._disk_paused = True
+                log_lifecycle_event(
+                    "DISK_PAUSE_ENGAGED",
+                    free_gb=f"{free_gb:.1f}",
+                    threshold_gb=DISK_PAUSE_THRESHOLD_GB,
+                )
                 logger.error(
                     "[disk] Free space %.1f GB below pause threshold %.1f GB — pausing all writes",
                     free_gb, DISK_PAUSE_THRESHOLD_GB,
                 )
             elif self._disk_paused and free_gb >= DISK_RESUME_THRESHOLD_GB:
                 self._disk_paused = False
+                log_lifecycle_event(
+                    "DISK_PAUSE_RELEASED",
+                    free_gb=f"{free_gb:.1f}",
+                    threshold_gb=DISK_RESUME_THRESHOLD_GB,
+                )
                 logger.info(
                     "[disk] Free space %.1f GB above resume threshold %.1f GB — resuming writes",
                     free_gb, DISK_RESUME_THRESHOLD_GB,
@@ -641,12 +677,19 @@ class Service:
             self._global_paused = paused
             for out in self._outputs:
                 out.set_paused(paused)
+        log_lifecycle_event(
+            "GLOBAL_PAUSE_ENGAGED" if paused else "GLOBAL_PAUSE_RELEASED",
+        )
         logger.info("Global pause: %s", paused)
 
     def set_output_enabled(self, name: str, enabled: bool) -> bool:
         for out in self._outputs:
             if out.name == name:
                 out.set_enabled(enabled)
+                log_lifecycle_event(
+                    "OUTPUT_ENABLED" if enabled else "OUTPUT_DISABLED",
+                    name=name,
+                )
                 return True
         return False
 
@@ -706,14 +749,3 @@ class Service:
             ],
         }
 
-    def reload_config(self, new_config: ServiceConfig) -> None:
-        """Apply safe runtime config changes (enable/disable outputs, segment duration).
-        Codec/container changes require a full restart.
-        """
-        logger.info("Reloading config (safe changes only)")
-        existing = {out.name: out for out in self._outputs}
-        for cfg in new_config.outputs:
-            if cfg.name in existing:
-                existing[cfg.name].set_enabled(cfg.enabled)
-                existing[cfg.name].segment_seconds = cfg.segment_seconds
-        self.config = new_config

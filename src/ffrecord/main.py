@@ -73,8 +73,14 @@ def main() -> None:
     log.info("ffrecord starting — channel=%s device=%d", cfg.channel.name, cfg.channel.decklink_device_index)
     log.info("Config: %d output(s) configured", len(cfg.outputs))
     for out in cfg.outputs:
-        log.info("  Output %-20s  type=%-4s  enabled=%s  segment=%ds",
-                 out.name, out.type, out.enabled, out.segment_seconds)
+        splitter = (
+            f"app/{out.internal_splitter.seconds}s" if out.internal_splitter.enabled
+            else "libav"
+        )
+        log.info(
+            "  Output %-20s  container=%-8s  enabled=%s  splitter=%s",
+            out.name, out.container_format, out.enabled, splitter,
+        )
 
     service = Service(cfg)
     _shutdown_event = threading.Event()
@@ -88,14 +94,10 @@ def main() -> None:
         log.info("Shutting down (%s)...", sig_str)
         _shutdown_event.set()
 
-    def _reload(signum, frame):
-        log.info("Received SIGHUP — reloading config from %s", args.config)
-        try:
-            new_cfg = load_config(args.config)
-            service.reload_config(new_cfg)
-        except Exception as e:
-            log.error("Config reload failed: %s", e)
-
+    # Config changes require a process restart — no runtime reload. The previous
+    # SIGHUP path only propagated `enabled`/`segment_seconds` for outputs whose
+    # names already existed; adds/removes were silently dropped, which is a
+    # broadcast footgun. Removed entirely.
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
     # Windows console control events — only register if supported
@@ -109,9 +111,6 @@ def main() -> None:
             signal.signal(signal.CTRL_BREAK_EVENT, _shutdown)
         except (ValueError, RuntimeError):
             pass
-    # SIGHUP is Unix-only; skip on Windows (Windows uses Ctrl+C → SIGINT)
-    if hasattr(signal, "SIGHUP"):
-        signal.signal(signal.SIGHUP, _reload)
 
     # ── start ────────────────────────────────────────────────────────────────
 
