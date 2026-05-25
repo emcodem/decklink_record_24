@@ -12,10 +12,10 @@ Segmentation strategy:
     at the first frame and stays open; muxer-specific options (e.g. hls_time)
     drive any internal segmentation. PTS is continuous.
 
-Per-frame encode preserves the two paths inherited from the previous
-FileOutput so the AVFrame pass-through path keeps working (interlaced
-metadata survives without a per-frame setfield filter, sidestepping the
-PyAV 17 thread-safety bug at full-HD).
+Per-frame encode supports two paths: AVFrame pass-through (preserves
+interlaced metadata without a per-frame setfield filter, sidestepping the
+PyAV 17 thread-safety bug at full-HD) and numpy→VideoFrame for paths that
+strip metadata intentionally.
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ class EncoderOutput(OutputThread):
     """One encoder loop for any libav container — config drives behaviour."""
 
     def __init__(self, cfg: OutputConfig, channel_name: str):
-        super().__init__(cfg.name, channel_name, cfg.internal_splitter.seconds)
+        super().__init__(cfg.name, channel_name)
         self.cfg = cfg
         # Pre-warmed state, populated by prewarm_codec(). Adopted on the first
         # real pair so avcodec_open2() doesn't stall the DeckLink COM thread.
@@ -251,10 +251,9 @@ class EncoderOutput(OutputThread):
 
                 filtered_frames = list(vfilter.process(frame.data)) if vfilter else [frame.data]
 
-                # L4: per-output filter yielded no frames for this pair. The
-                # historical FileOutput / HlsOutput only skipped silently when
-                # the container existed; surface it as a graduated WARNING so
-                # mid-stream filter dropouts are visible.
+                # L4: per-output filter yielded no frames for this pair.
+                # Surface it as a graduated WARNING so mid-stream filter
+                # dropouts are visible instead of being silently dropped.
                 if not filtered_frames:
                     filter_dropouts_total += 1
                     self._maybe_log_filter_dropout(filter_dropouts_total)

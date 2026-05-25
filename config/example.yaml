@@ -2,6 +2,22 @@
 #
 # Start with:  ffrecord --config config\example.yaml
 # Or:          python -m ffrecord.main --config config\example.yaml
+#
+# Mental model for ffmpeg users
+# ──────────────────────────────────────────────────────────────────────────────
+# ffrecord is roughly equivalent to one persistent ffmpeg pipeline per `outputs`
+# entry, all sharing the same DeckLink capture:
+#
+#   DeckLink → capture.video_filter   (channel-level -vf, runs once for the
+#                                      capture, results shared by all outputs)
+#       │
+#       ├── output A: output.video_filter → encoder(video) + encoder(audio) → muxer → file
+#       ├── output B: output.video_filter → encoder(video) + encoder(audio) → muxer → HLS playlist
+#       └── output C: …
+#
+# Each output is independent, so a single capture can drive simultaneous
+# archive + low-bitrate proxy + HLS preview pipelines with different encoders,
+# pixel formats, framerates and containers.
 
 channel:
   name: CH1                      # Supported: any string. Used in path templates as {CH} and in log filenames.
@@ -24,13 +40,17 @@ channel:
 
 capture:
   audio_channels: 8              # Supported: integer 1..16. How many SDI audio channels to ingest.
+                                 # Equivalent to ffmpeg's  -f decklink -channels N  input flag.
   pix_fmt: yuv420p               # Supported: any ffmpeg pix_fmt. Common: yuv420p, yuv422p, yuv444p, p010le, yuv422p10le, nv12.
                                  # This is the target output format for the filter chain (auto-appended as a `format=` filter).
-  # video_filter — full ffmpeg-style filter chain, comma-separated. Leave empty
-  # ("") for passthrough (raw uyvy422 straight to the encoder, no filter graph).
-  # The graph's actual output framerate/size/pix_fmt are queried after build and
-  # propagated to the encoder, so a filter that changes the rate (e.g. bwdif=mode=1
-  # 25→50 fps) is handled correctly without manual config.
+                                 # Equivalent to the final `,format=<pix_fmt>` you'd put at the tail of an ffmpeg -vf chain.
+  # video_filter — channel-level filter graph. Equivalent to ffmpeg's `-vf <chain>` applied ONCE to
+  # the capture, with its output fanned out to every per-output encoder.
+  # Full ffmpeg-style filter chain, comma-separated. Leave empty ("") for passthrough (raw uyvy422
+  # straight to the encoder, no filter graph).
+  # The graph's actual output framerate/size/pix_fmt are queried after build and propagated to the
+  # encoder, so a filter that changes the rate (e.g. bwdif=mode=1 25→50 fps) is handled correctly
+  # without manual config.
   # Commas inside filter args are supported via single-quoted regions
   # (text='hello, world') or backslash escapes (text=hello\, world), so most
   # working ffmpeg `-vf` strings can be pasted verbatim.
@@ -73,76 +93,222 @@ logging:
   file_rotation_days: 7          # Supported: integer >= 1. Days of logs to retain per channel.
   level: INFO                    # Supported: DEBUG | INFO | WARNING | ERROR
 
+# ── outputs ───────────────────────────────────────────────────────────────────
+# Each entry is one independent encode+mux pipeline driven by the same capture.
+#
+# Outputs schema, mapped to ffmpeg command-line equivalents:
+#
+#   name                    Identifier shown in logs, /status, /outputs/{name}/...
+#                           Also available as {output} in path_template.
+#
+#   enabled                 true | false. Disabled outputs don't open files but still parse.
+#
+#   path_template           Output URL/path. Same string ffmpeg would receive as its
+#                           final positional argument. Placeholders (substituted per segment):
+#                             {output}              this output's name
+#                             {CH}                  channel.name
+#                             {YYYYMMDD}            UTC date         (e.g. 20260526)
+#                             {YYYYMMDDHH}          UTC date+hour    (e.g. 2026052614)
+#                             {YYYYMMDDHHmmssms}    UTC date+time+ms (e.g. 20260526143012345)
+#                             {starttime_unix_ms}   epoch ms at segment start
+#                             {seq}                 zero-padded 6-digit sequence number (resets per session)
+#
+#   container_format        libav muxer name. Equivalent to ffmpeg's  -f <fmt>  flag.
+#                           Examples: mov, mp4, mxf, matroska, mpegts, hls, dash, segment.
+#                           The path extension is NOT used to infer the muxer; this field is.
+#
+#   container_options       Dict of muxer-specific options. Equivalent to the ffmpeg flags that
+#                           appear BETWEEN `-f <fmt>` and the output path. Passed through to
+#                           libav verbatim (string-coerced). Examples:
+#                             hls_time, hls_list_size, hls_flags, hls_segment_type   (HLS muxer)
+#                             movflags                                               (MOV/MP4)
+#                             segment_time, segment_format                           (segment muxer)
+#                           See the official ffmpeg muxer docs:  https://ffmpeg.org/ffmpeg-formats.html
+#
+#   internal_splitter       Controls who slices the output into segments.
+#     enabled               false (default) → libav owns segmentation. The container is opened
+#                                             once at the first frame and stays open; any sub-
+#                                             segmentation comes from container_options (e.g.
+#                                             hls_time for HLS, segment_time for the segment
+#                                             muxer). PTS is continuous from the first frame.
+#                                             Use this for HLS, DASH, mpegts, segment muxer.
+#                           true            → app-managed segmentation. ffrecord closes the
+#                                             container and reopens a new one every `seconds`
+#                                             frames (using a fresh path_template render). Each
+#                                             file starts at PTS=0, so every segment is an
+#                                             independent playable file. Closest ffmpeg analogue:
+#                                             killing+restarting ffmpeg every N seconds.
+#                                             Use this for archive (.mov, .mxf, .mp4 chunks).
+#     seconds               Segment length in seconds of captured video (frame-exact, not
+#                           wall-clock). Required when enabled=true.
+#
+#   video_filter            Per-output video filter chain. Same syntax as capture.video_filter.
+#                           Applied AFTER the channel-level capture.video_filter, so this is
+#                           where a per-output scale/fps tweak goes (e.g. low-res for HLS,
+#                           full-res for archive). Equivalent to a second `-vf` applied just
+#                           before this output's encoder. Leave "" to pass capture frames
+#                           through unchanged.
+#
+#   audio_filter            Per-output audio filter chain. Equivalent to `-af`. Rarely needed —
+#                           channel routing/downmix is handled by audio.channels/downmix below.
+#
+#   video.codec             ffmpeg `-c:v <codec>`. Any codec libav can encode. Common:
+#                             libx264, libx265, h264_nvenc, hevc_nvenc, av1_nvenc,
+#                             mpeg2video, prores_ks, dnxhd, ffv1
+#   video.preset            ffmpeg `-preset <name>`. Codec-specific:
+#                             libx264 / libx265:    ultrafast .. veryslow
+#                             *_nvenc:              p1 (fastest) .. p7 (slowest), or legacy llhp/llhq/...
+#                             prores_ks:            ignored (uses profile)
+#   video.bitrate           ffmpeg `-b:v <rate>`. Accepts "8M", "500k", "20000000".
+#                           For CBR-like behaviour also set minrate/maxrate/bufsize in `options`.
+#   video.pix_fmt           ffmpeg `-pix_fmt <fmt>`. Encoder input format. Common:
+#                             yuv420p (8-bit 4:2:0), yuv422p (4:2:2), p010le (10-bit NV12),
+#                             yuv422p10le, nv12, yuv444p, rgb24.
+#   video.profile           ffmpeg `-profile:v <profile>`. Codec-specific:
+#                             libx264: baseline | main | high | high10 | high422 | high444
+#                             libx265 / hevc_nvenc: main | main10 | main12 | main444 | ...
+#                             mpeg2video: 0..5 (0=4:2:2 Profile, used for broadcast MXF)
+#                             prores_ks: 0..5 (proxy, lt, std, hq, 4444, xq)
+#   video.gop               GOP / keyframe interval. Three forms:
+#                             "auto"        → leave to codec default; equivalent to no `-g` flag.
+#                             N (integer)   → ffmpeg `-g N`. Keyframe every N frames.
+#                             "seconds:N"   → resolved at start time to round(N * fps) frames.
+#                                             Convenient for HLS, where keyframes must align with
+#                                             segment boundaries: gop=hls_time*fps.
+#   video.options           Free-form dict of additional ffmpeg/libav codec options. Equivalent
+#                           to arbitrary `-key value` flags after `-c:v <codec>`. Values are
+#                           string-coerced. Examples by codec:
+#                             libx264:      crf, tune, profile, level, x264-params
+#                             *_nvenc:      rc, cq, multipass, spatial-aq, temporal-aq, b_ref_mode
+#                             mpeg2video:   intra_vlc, non_linear_quant, qmin/qmax/dc, alternate_scan,
+#                                           field_order, top, flags (e.g. +ildct+ilme), seq_disp_ext,
+#                                           video_format, color_primaries, color_trc, colorspace, ...
+#                             prores_ks:    vendor (apl0 to identify as Apple), bits_per_mb
+#                           Anything libav documents for the codec works — see
+#                           https://ffmpeg.org/ffmpeg-codecs.html
+#
+#   Precedence and redundancy: `options` overlaps with several typed fields
+#   above. The merge order in build_video_stream() (output/util.py) is:
+#         1. set codec_opts["profile"] = video.profile   (if set)
+#         2. codec_opts.update(video.options)            (merges options in)
+#         3. set codec_opts["preset"]  = video.preset    (if set)
+#         4. set codec_opts["g"]       = <gop frames>    (only if "g" NOT in options)
+#   Which produces these conflict-resolution rules:
+#         video.profile  vs  options.profile  →  OPTIONS WINS
+#         video.preset   vs  options.preset   →  FIELD WINS
+#         video.gop      vs  options.g        →  OPTIONS WINS
+#         (video.gop="seconds:N" has no options equivalent — fps-dependent,
+#          resolved at start time.)
+#   Which fields could be expressed via `options` instead:
+#         codec     — NO  (selects the encoder itself, passed to add_stream())
+#         pix_fmt   — NO  (set on codec_context.pix_fmt, not an option key)
+#         bitrate   — NO in practice (sets stream.bit_rate attribute; also gives
+#                                     you "50M"/"500k" string parsing)
+#         profile   — YES (drop the field, put `profile: main10` in options)
+#         preset    — YES (drop the field, put `preset: p7`      in options)
+#         gop  (N)  — YES (drop the field, put `g: "60"`         in options)
+#         gop  ("seconds:N")  — NO  (no fps-aware equivalent in options)
+#
+#   audio.channels          List of 1-based SDI input channel indices to include in this output.
+#                           Equivalent to selecting specific input audio streams with `-map 0:a:i`
+#                           in ffmpeg. [1, 2] picks the first stereo pair; [1..8] grabs all 8 SDI
+#                           channels for embedded multi-track audio.
+#   audio.downmix           "none" (default) | "stereo".
+#                             "stereo" — downmixes the selected channels to a single stereo pair.
+#                                        Closest ffmpeg analogue: `-ac 2` with the default
+#                                        downmix matrix, applied to the selected channels.
+#                                        Forces track_mode="combined" (1 stereo stream).
+#                             "none"   — channels pass through as-is.
+#   audio.track_mode        Only relevant when downmix="none":
+#                             "combined"          → ONE audio stream containing all selected
+#                                                   channels as an interleaved N-channel layout.
+#                                                   Like ffmpeg producing a single `-c:a <codec>`
+#                                                   output with layout=Nc.
+#                             "mono_per_channel"  → N PARALLEL mono streams, one per selected
+#                                                   channel. Equivalent to N separate
+#                                                   `-map 0:a:i -c:a <codec>` outputs sharing
+#                                                   one container. Broadcast/NLE-friendly for
+#                                                   8-channel SDI archives.
+#                                                   NOT allowed for container_format=hls (libav's
+#                                                   HLS muxer cannot carry N parallel mono
+#                                                   streams) — _validate_output() rejects this.
+#   audio.codec             ffmpeg `-c:a <codec>`. Common:
+#                             aac, libopus, libmp3lame, ac3, eac3,
+#                             pcm_s16le, pcm_s24le, pcm_s32le,         (uncompressed)
+#                             flac, alac                               (lossless compressed)
+#   audio.bitrate           ffmpeg `-b:a <rate>`. Accepts "128k", "192k", "1M". Ignored for
+#                           PCM codecs (rate is fixed by sample_rate × bits × channels).
+
 outputs:
-  # All outputs use the same EncoderOutput class. The container_format string
-  # selects the libav muxer; container_options are passed straight to it.
-  # internal_splitter.enabled = true → app closes+reopens the container every N
-  # seconds of frames so each file is independently playable (use for archive).
-  # internal_splitter.enabled = false (default) → libav handles any sub-
-  # segmentation via its own options (use for HLS / DASH / mpegts).
 
   # ── HLS live preview (libav-managed, rolling 2-chunk window) ────────────────
   - name: hls_preview
     enabled: true
-    # path_template — placeholders: {output}, {CH}, {YYYYMMDDHH}, {starttime_unix_ms}, {seq}
     path_template: "recording/{output}/{CH}/playlist.m3u8"
     container_format: hls
-    container_options:
-      hls_time: "2"
-      hls_list_size: "2"
-      hls_flags: "delete_segments+append_list"
-      hls_segment_type: "mpegts"
+    container_options:                       # ffmpeg equivalent (after `-f hls`):
+      hls_time: "2"                          #   -hls_time 2
+      hls_list_size: "2"                     #   -hls_list_size 2
+      hls_flags: "delete_segments+append_list" #  -hls_flags delete_segments+append_list
+      hls_segment_type: "mpegts"             #   -hls_segment_type mpegts
     internal_splitter:
-      enabled: false             # libav's HLS muxer slices internally
-    video_filter: "scale=320:-2"
+      enabled: false                         # HLS muxer slices internally — must be false here.
+    video_filter: "scale=320:-2"             # `-vf scale=320:-2` — keep aspect, height auto-even.
     video:
-      codec: libx264
-      preset: ultrafast
-      bitrate: "300k"
-      gop: "seconds:2"           # Force GOP = 2s × fps for HLS keyframe alignment.
+      codec: libx264                         # `-c:v libx264`
+      preset: ultrafast                      # `-preset ultrafast`
+      bitrate: "300k"                        # `-b:v 300k`
+      gop: "seconds:2"                       # `-g <2 * fps>` — keyframes at every segment boundary.
       options:
-        tune: zerolatency
+        tune: zerolatency                    # `-tune zerolatency` — low-delay encode for live preview
     audio:
-      channels: [1, 2]
-      downmix: stereo
-      track_mode: combined       # HLS only supports combined; validation will reject mono_per_channel.
-      codec: aac
-      bitrate: "64k"
+      channels: [1, 2]                       # SDI ch 1+2 (left/right of the first stereo pair)
+      downmix: stereo                        # downmix to 2-ch stereo
+      track_mode: combined                   # HLS only supports combined; validation rejects mono_per_channel.
+      codec: aac                             # `-c:a aac`
+      bitrate: "64k"                         # `-b:a 64k`
 
   # ── High-res archive (app-managed 10s MOV segments) ────────────────────────
   - name: archive
     enabled: true
     path_template: "recording/{output}/{CH}/{YYYYMMDDHH}/{starttime_unix_ms}.mov"
-    container_format: mov
-    container_options: {}        # e.g. movflags: faststart (rarely needed for archive)
+    container_format: mov                    # `-f mov`
+    container_options: {}                    # e.g. movflags: faststart (rarely needed for archive)
     internal_splitter:
-      enabled: true              # close+reopen container per segment
-      seconds: 10                # exact duration in frames (deterministic)
+      enabled: true                          # close+reopen container per segment so each file
+      seconds: 10                            # plays from PTS=0 — frame-exact 10 s chunks.
     video:
-      codec: hevc_nvenc
-      profile: main10
-      pix_fmt: p010le
-      preset: p7
-      bitrate: "50M"
-      gop: auto
+      codec: hevc_nvenc                      # `-c:v hevc_nvenc`
+      profile: main10                        # `-profile:v main10` — 10-bit HEVC
+      pix_fmt: p010le                        # `-pix_fmt p010le` — 10-bit semi-planar
+      preset: p7                             # `-preset p7` — NVENC slowest/highest quality
+      bitrate: "50M"                         # `-b:v 50M`
+      gop: auto                              # leave to codec default (no `-g` flag)
     audio:
-      channels: [1, 2, 3, 4, 5, 6, 7, 8]
+      channels: [1, 2, 3, 4, 5, 6, 7, 8]     # archive all 8 SDI channels
       downmix: none
-      track_mode: mono_per_channel   # 8 separate mono streams (broadcast/NLE-friendly)
-      codec: pcm_s24le
+      track_mode: mono_per_channel           # 8 separate mono streams (broadcast/NLE-friendly)
+      codec: pcm_s24le                       # `-c:a pcm_s24le` (24-bit PCM, lossless)
 
   # ── Proxy MP4 (same source, lighter bitrate for NLE import) ─────────────────
+  # Disabled example — uncomment and tweak to enable. Same input, different
+  # encoder/container, longer (10-minute) app-managed segments.
   # - name: proxy_mp4
-  #   type: file
   #   enabled: false
-  #   path_template: "{output}/{CH}/{YYYYMMDDHH}/{starttime_unix_ms}.mp4"
-  #   segment_seconds: 600
+  #   path_template: "recording/{output}/{CH}/{YYYYMMDDHH}/{starttime_unix_ms}.mp4"
+  #   container_format: mp4                  # `-f mp4`
+  #   container_options:
+  #     movflags: "+faststart"               # `-movflags +faststart` — moov atom at file head
+  #   internal_splitter:
+  #     enabled: true
+  #     seconds: 600                         # 10-minute chunks
   #   video:
-  #     codec: h264_nvenc
-  #     preset: p4
-  #     bitrate: "8M"
+  #     codec: h264_nvenc                    # `-c:v h264_nvenc`
+  #     preset: p4                           # `-preset p4` — balanced NVENC preset
+  #     bitrate: "8M"                        # `-b:v 8M`
+  #     pix_fmt: yuv420p                     # `-pix_fmt yuv420p` — broad NLE compatibility
   #   audio:
   #     channels: [1, 2]
   #     downmix: stereo
-  #     codec: aac
-  #     bitrate: "192k"
+  #     codec: aac                           # `-c:a aac`
+  #     bitrate: "192k"                      # `-b:a 192k`

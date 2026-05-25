@@ -5,9 +5,6 @@ container format to write, which options to pass to it, and whether the app
 manages segmentation (close+reopen per N seconds, used by the archive case
 where each file must be independently playable) or leaves that to libav (used
 by HLS, DASH, the segment muxer, anything that splits internally).
-
-Legacy `type` / `segment_seconds` / `hls_list_size` are accepted with a
-deprecation warning so existing YAMLs continue to work for one release.
 """
 
 from __future__ import annotations
@@ -72,15 +69,6 @@ class OutputConfig:
     audio_filter: str = ""
     video: VideoEncoderConfig = field(default_factory=VideoEncoderConfig)
     audio: AudioEncoderConfig = field(default_factory=AudioEncoderConfig)
-
-    # ── legacy compatibility ────────────────────────────────────────────────
-    # These are populated by _parse_output() from either the new fields or the
-    # legacy ones; keep them around so the existing FileOutput / HlsOutput keep
-    # working until they are replaced by EncoderOutput. Drop both when those
-    # files are deleted.
-    type: str = "file"               # legacy "file" | "hls"
-    segment_seconds: int = 600       # legacy; derived from internal_splitter.seconds
-    hls_list_size: int = 2           # legacy; mirrored into container_options
 
 
 @dataclass
@@ -151,115 +139,35 @@ def _parse_internal_splitter(d: dict) -> InternalSplitterConfig:
     )
 
 
-def _infer_container_from_path(path: str) -> str:
-    """Map a path extension to a libav container_format string.
-
-    Used to migrate legacy `type: file` configs. Unknown extensions default to
-    "mov" since that was the historical FileOutput behaviour.
-    """
-    suffix = Path(path).suffix.lower().lstrip(".")
-    return {
-        "mov": "mov",
-        "mp4": "mp4",
-        "m4v": "mp4",
-        "mxf": "mxf",
-        "mkv": "matroska",
-        "ts": "mpegts",
-    }.get(suffix, "mov")
+# Output keys that were valid in the pre-unification schema. Their presence
+# now indicates an un-migrated YAML — we refuse to start rather than silently
+# fall back to defaults that may differ from the operator's intent.
+_LEGACY_OUTPUT_FIELDS = ("type", "segment_seconds", "hls_list_size")
 
 
 def _parse_output(d: dict, output_index: int) -> OutputConfig:
     name = d.get("name", f"output{output_index}")
 
-    # Detect legacy config — presence of `type:` indicates the pre-unification
-    # schema. Emit a deprecation warning and synthesize the new fields.
-    legacy_type = d.get("type")
-    has_new_container_format = "container_format" in d
-    has_internal_splitter = "internal_splitter" in d
-
-    if legacy_type is not None and not has_new_container_format:
-        legacy_segment_seconds = int(d.get("segment_seconds", 600))
-        legacy_hls_list_size = int(d.get("hls_list_size", 2))
-        path_template = d["path_template"]
-
-        if legacy_type == "hls":
-            container_format = "hls"
-            container_options = {
-                "hls_time": str(legacy_segment_seconds),
-                "hls_list_size": str(legacy_hls_list_size),
-                "hls_flags": "delete_segments+append_list",
-            }
-            internal_splitter_cfg = InternalSplitterConfig(enabled=False)
-            # Preserve the implicit "GOP = segment_seconds × fps" that the old
-            # HlsOutput hard-coded.
-            video_d = d.get("video", {}) or {}
-            if "gop" not in video_d:
-                video_d = dict(video_d)
-                video_d["gop"] = f"seconds:{legacy_segment_seconds}"
-        else:  # "file" or unknown — treat as app-managed file
-            container_format = _infer_container_from_path(path_template)
-            container_options = {}
-            internal_splitter_cfg = InternalSplitterConfig(
-                enabled=True, seconds=legacy_segment_seconds,
-            )
-            video_d = d.get("video", {}) or {}
-
-        logger.warning(
-            "[config] output '%s': legacy schema (type=%s segment_seconds=%d) is "
-            "deprecated. Migrate to container_format=%r + internal_splitter to "
-            "silence this warning. Auto-translated for now.",
-            name, legacy_type, legacy_segment_seconds, container_format,
+    legacy_present = [k for k in _LEGACY_OUTPUT_FIELDS if k in d]
+    if legacy_present:
+        raise ValueError(
+            f"Output '{name}' uses removed legacy schema fields: "
+            f"{', '.join(legacy_present)}. Migrate to container_format + "
+            f"container_options + internal_splitter (see config/example.yaml)."
         )
 
-        out = OutputConfig(
-            name=name,
-            path_template=path_template,
-            container_format=container_format,
-            container_options=container_options,
-            internal_splitter=internal_splitter_cfg,
-            enabled=d.get("enabled", True),
-            video_filter=d.get("video_filter", ""),
-            audio_filter=d.get("audio_filter", ""),
-            video=_parse_video(video_d),
-            audio=_parse_audio(d.get("audio", {})),
-            type=legacy_type,
-            segment_seconds=legacy_segment_seconds,
-            hls_list_size=legacy_hls_list_size,
-        )
-    else:
-        # New-schema path.
-        container_format = d.get("container_format", "mov")
-        internal_splitter_cfg = _parse_internal_splitter(d.get("internal_splitter", {}))
-        # Mirror new fields into legacy ones so the still-extant FileOutput /
-        # HlsOutput continue to work during the migration window. Once those
-        # files are deleted, drop this block.
-        if has_internal_splitter and internal_splitter_cfg.enabled:
-            inferred_type = "file"
-            inferred_segment_seconds = internal_splitter_cfg.seconds
-        elif container_format == "hls":
-            inferred_type = "hls"
-            inferred_segment_seconds = int(d.get("container_options", {}).get(
-                "hls_time", internal_splitter_cfg.seconds,
-            ))
-        else:
-            inferred_type = "file"
-            inferred_segment_seconds = internal_splitter_cfg.seconds
-
-        out = OutputConfig(
-            name=name,
-            path_template=d["path_template"],
-            container_format=container_format,
-            container_options=d.get("container_options", {}) or {},
-            internal_splitter=internal_splitter_cfg,
-            enabled=d.get("enabled", True),
-            video_filter=d.get("video_filter", ""),
-            audio_filter=d.get("audio_filter", ""),
-            video=_parse_video(d.get("video", {})),
-            audio=_parse_audio(d.get("audio", {})),
-            type=inferred_type,
-            segment_seconds=inferred_segment_seconds,
-            hls_list_size=int(d.get("container_options", {}).get("hls_list_size", 2)),
-        )
+    out = OutputConfig(
+        name=name,
+        path_template=d["path_template"],
+        container_format=d.get("container_format", "mov"),
+        container_options=d.get("container_options", {}) or {},
+        internal_splitter=_parse_internal_splitter(d.get("internal_splitter", {})),
+        enabled=d.get("enabled", True),
+        video_filter=d.get("video_filter", ""),
+        audio_filter=d.get("audio_filter", ""),
+        video=_parse_video(d.get("video", {})),
+        audio=_parse_audio(d.get("audio", {})),
+    )
 
     _validate_output(out)
     return out

@@ -1,10 +1,10 @@
 """Per-output bounded queue between the pairing layer and an encoder thread.
 
-Each OutputThread (FileOutput, HlsOutput) owns one EncodingBuffer. The
-capture/pairing side calls push() with a complete AVPair; the encoder side
-calls get() with a timeout. When the queue is full, push() drops the
-incoming item and counts the drop — same backpressure policy as the
-previous separate _video_queue, just consolidated into one place.
+Each OutputThread owns one EncodingBuffer. The capture/pairing side calls
+push() with a complete AVPair; the encoder side calls get() with a timeout.
+When the queue is full, push() drops the incoming item and counts the drop —
+same backpressure policy as the previous separate _video_queue, just
+consolidated into one place.
 
 This class is intentionally generic (no AVPair import) to keep it free of
 circular dependencies with output/base.py, where AVPair lives.

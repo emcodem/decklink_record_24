@@ -123,10 +123,9 @@ class OutputThread(ABC):
     PERSISTENT_CRASH_THRESHOLD = 5
     STATS_INTERVAL = 5.0  # seconds between [stats] heartbeat lines
 
-    def __init__(self, name: str, channel_name: str, segment_seconds: int):
+    def __init__(self, name: str, channel_name: str):
         self.name = name
         self.channel_name = channel_name
-        self.segment_seconds = segment_seconds
         self.stats = OutputStats()
         self.video_pkts_muxed = 0    # incremented by subclasses after container.mux()
         self.audio_pkts_muxed = 0

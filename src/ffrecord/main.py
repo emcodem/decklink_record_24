@@ -94,10 +94,7 @@ def main() -> None:
         log.info("Shutting down (%s)...", sig_str)
         _shutdown_event.set()
 
-    # Config changes require a process restart — no runtime reload. The previous
-    # SIGHUP path only propagated `enabled`/`segment_seconds` for outputs whose
-    # names already existed; adds/removes were silently dropped, which is a
-    # broadcast footgun. Removed entirely.
+    # Config changes require a process restart — no runtime reload.
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
     # Windows console control events — only register if supported
