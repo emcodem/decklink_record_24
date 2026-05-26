@@ -142,10 +142,19 @@ class InputVideoFilter:
                 self.output_framerate[0], self.output_framerate[1],
             )
         else:
+            # No filter spec — build a minimal format-conversion graph so that
+            # output frames are in the requested pix_fmt rather than raw uyvy422.
+            # PyAV's to_ndarray() does not support uyvy422, so passthrough without
+            # format conversion causes a ValueError on every frame.
+            self._spec = f"format={self.requested_pix_fmt}"
+            self._build_graph()
+            self._query_sink()
             logger.info(
-                "No video_filter configured — passthrough %dx%d uyvy422 @ %d/%d",
-                self.input_width, self.input_height,
-                self.input_framerate[0], self.input_framerate[1],
+                "No video_filter configured — format-only passthrough: "
+                "uyvy422 → %s %dx%d @ %d/%d",
+                self.output_pix_fmt,
+                self.output_width, self.output_height,
+                self.output_framerate[0], self.output_framerate[1],
             )
 
     def _build_graph(self) -> None:
