@@ -1,0 +1,184 @@
+================================================================================
+FFRecord Monitoring Tools - Quick Reference
+================================================================================
+
+Scripts are in debugging\ within this project.
+Bat wrappers are in C:\dev\cmd_recorder\scripts\tools\
+
+WHEN TO USE EACH TOOL:
+
++- Device Locked? -----------------------------------------------------------------+
+| Problem: Other app is using the device                                           |
+| Tool: venv\Scripts\python.exe debugging\check_decklink_availability.py           |
+|    or: C:\dev\cmd_recorder\scripts\tools\check_devices.bat                       |
+| Time: 10 seconds                                                                 |
+| Output: [AVAILABLE] or [IN USE]                                                  |
++----------------------------------------------------------------------------------+
+
++- No Video Signal? ---------------------------------------------------------------+
+| Problem: Cable not connected, source off, wrong format                           |
+| Tool: C:\dev\cmd_recorder\scripts\tools\detect_signal.bat 1  (1=CH02, 0=CH01)   |
+| Time: 15 seconds                                                                 |
+| Output: SIGNAL DETECTED or NO SIGNAL                                             |
++----------------------------------------------------------------------------------+
+
++- 0 FPS Persisting? --------------------------------------------------------------+
+| Problem: Capturing, but getting 0 frames                                         |
+| Tool: C:\dev\cmd_recorder\scripts\tools\monitor_capture_health.bat               |
+| Time: Continuous (alerts after 30s of 0 fps)                                     |
+| Output: Real-time alerts with causes and fixes                                   |
++----------------------------------------------------------------------------------+
+
++- Everything Wrong? --------------------------------------------------------------+
+| Problem: Don't know where to start                                               |
+| Tool: C:\dev\cmd_recorder\scripts\tools\quick_troubleshoot.bat                   |
+| Time: 3 minutes (runs all checks in order)                                       |
+| Output: Step-by-step diagnosis with recommended fixes                            |
++----------------------------------------------------------------------------------+
+
+================================================================================
+TYPICAL TROUBLESHOOTING FLOW:
+================================================================================
+
+1. Device shows 0 fps in logs?
+   |
+2. Run: C:\dev\cmd_recorder\scripts\tools\quick_troubleshoot.bat
+   (Runs all diagnostics automatically)
+   |
+3. Check output:
+   * Device [AVAILABLE]? -> Go to 4
+   * Device [IN USE]?    -> Close other apps, re-run quick_troubleshoot.bat
+   |
+4. Signal detected?
+   * SIGNAL DETECTED -> Check format matches YAML, restart recorder
+   * NO SIGNAL       -> Check cable, verify source is on, try reconnecting
+   |
+5. Still 0 fps?
+   * Run: C:\dev\cmd_recorder\scripts\tools\monitor_capture_health.bat
+   * Keep it running while recorder runs
+   * Wait for alert (after 30s of 0 fps)
+   * Follow alert instructions
+
+================================================================================
+COMMON ISSUES & SOLUTIONS:
+================================================================================
+
+ISSUE: Device shows [IN USE]
+  FIX: Close these applications:
+    - Blackmagic Desktop Video Control Panel
+    - DaVinci Resolve
+    - Media Express
+    - OBS Studio
+    - Any other ffrecord instances
+  VERIFY: Re-run check_devices.bat
+
+ISSUE: Signal detection shows NO SIGNAL
+  FIX: Check in this order:
+    1. Is SDI/HDMI cable plugged into device input port? (not output)
+    2. Is video source powered on?
+    3. Is video source actively outputting? (can you see it on source monitor?)
+    4. Try disconnecting/reconnecting cable
+    5. Try different cable
+    6. Try different video source
+
+ISSUE: Signal detected but format doesn't match config
+  Example:
+    Config: expected_format: "1080i50"
+    Signal: SIGNAL DETECTED: 1080p60  <- MISMATCH!
+  FIX: Edit C:\dev\cmd_recorder\ffrecord_configs\ch02.yaml
+       Change: expected_format: "1080p60"
+       Restart recorder
+
+ISSUE: Device available, signal detected, but still 0 fps
+  FIX: Run monitor_capture_health.bat to watch logs in real-time
+       It will alert with specific cause after 30 seconds of 0 fps
+
+ISSUE: Monitor shows "Device initialized but not capturing"
+  This means:
+    * Device opened successfully
+    * But no frames arriving
+  Likely causes (in order):
+    1. No video signal (check cable)
+    2. Format mismatch (use detect_signal.bat to check)
+    3. Device locked (run check_devices.bat)
+
+================================================================================
+COMMAND CHEAT SHEET:
+================================================================================
+
+Check if device is locked:
+  venv\Scripts\python.exe debugging\check_decklink_availability.py
+  -- or via wrapper --
+  C:\dev\cmd_recorder\scripts\tools\check_devices.bat
+
+Check if signal is reaching device (CH02):
+  C:\dev\cmd_recorder\scripts\tools\detect_signal.bat 1
+
+Check if signal is reaching device (CH01):
+  C:\dev\cmd_recorder\scripts\tools\detect_signal.bat 0
+
+Monitor capture health in real-time:
+  C:\dev\cmd_recorder\scripts\tools\monitor_capture_health.bat
+
+Run full automated troubleshooting:
+  C:\dev\cmd_recorder\scripts\tools\quick_troubleshoot.bat
+
+View last 50 lines of CH02 logs:
+  powershell -Command "Get-Content C:\dev\cmd_recorder\logs\ch02\*.log -Tail 50"
+
+View current running processes:
+  tasklist
+
+Kill all Python processes (use with caution):
+  taskkill /IM python.exe /F
+
+Kill Blackmagic Control Panel:
+  taskkill /IM BlackmagicControlPanel.exe /F
+
+================================================================================
+MONITORING SETUP (RECOMMENDED):
+================================================================================
+
+Terminal 1: Start recording
+  C:\dev\cmd_recorder\launch_all.ps1
+
+Terminal 2: Monitor capture health
+  C:\dev\cmd_recorder\scripts\tools\monitor_capture_health.bat
+
+Benefits:
+  * Real-time alerts if device fails to capture
+  * Automatic detection of silent failures (0 fps)
+  * Shows specific cause and recommended fix
+  * Can react immediately instead of waiting hours to notice
+
+================================================================================
+KEY FILES:
+================================================================================
+
+In this project (decklink_record_24):
+  debugging\monitor_capture_health.py      - Real-time log monitoring
+  debugging\detect_decklink_signal.py      - Signal detection script
+  debugging\check_decklink_availability.py - Check device availability
+  debugging\check_decklink_in_use.py       - Check process usage
+  debugging\diagnose_decklink.py           - Full device diagnostics
+
+In cmd_recorder:
+  scripts\tools\monitor_capture_health.bat - Run monitor easily
+  scripts\tools\detect_signal.bat          - Run signal detection easily
+  scripts\tools\check_devices.bat          - Run availability check easily
+  scripts\tools\quick_troubleshoot.bat     - Automated full diagnostics
+  ffrecord_configs\ch01.yaml               - CH01 config
+  ffrecord_configs\ch02.yaml               - CH02 config
+  logs\ch01\*.log                          - CH01 logs
+  logs\ch02\*.log                          - CH02 logs
+
+================================================================================
+MORE INFO:
+================================================================================
+
+For detailed information, see:
+  docs\NEW_MONITORING_TOOLS.md                    - Complete guide with examples
+  C:\dev\cmd_recorder\docs\DEVICE_DIAGNOSTICS.md  - Device setup and diagnostics
+  C:\dev\cmd_recorder\docs\MIGRATION_SUMMARY.md   - Full system documentation
+
+================================================================================
