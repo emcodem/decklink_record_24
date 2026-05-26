@@ -263,8 +263,7 @@ confirms the constant offset matches expectations.
 | `src/ffrecord/capture_buffer.py` | `CaptureBuffer`: hw_pts pairing, slicing, silence synthesis, byte cap |
 | `src/ffrecord/encoding_buffer.py` | `EncodingBuffer[T]`: generic bounded queue + drop / high-water logging |
 | `src/ffrecord/output/base.py` | `VideoFrame`, `AudioPacket`, `AVPair` dataclasses; `OutputThread` + `EncodingBuffer[AVPair]` |
-| `src/ffrecord/output/file_output.py` | MOV/MP4/MXF encoder loop consuming `AVPair` |
-| `src/ffrecord/output/hls_output.py` | HLS encoder loop consuming `AVPair` |
+| `src/ffrecord/output/encoder.py` | Encoder loop consuming `AVPair` (MOV/MP4/MXF and HLS) |
 | `src/ffrecord/service.py` | DeckLink callbacks → `CaptureBuffer` → fan-out to outputs |
 | `src/ffrecord/sync_log.py` | `[av_pair]` and `[enc_buf]` logging helpers |
 

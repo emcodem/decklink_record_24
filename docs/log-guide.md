@@ -181,6 +181,18 @@ Affected calls: `GetStreamTime`, `GetPacketTime`. When `GetStreamTime` fails
 the frame's `stream_time` is set to 0 and marked invalid; the encoder receives
 it with no hardware PTS.
 
+### `[mux]` — muxer write failures
+
+```
+[mux] FAILED output=<name> total=<N> reason=<description>
+[mux] FAILED output=<name> kind=video|audio <libav error>
+```
+
+Emitted when `av.Muxer.mux()` raises an exception. `total` is the cumulative
+failure count for this output since the encoder started. A single failure is
+often transient; a rising count alongside `Encoder crashed` lines indicates a
+systematic container or codec misconfiguration.
+
 ### Encoder crash lines (no tag)
 
 ```
