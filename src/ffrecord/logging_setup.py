@@ -52,3 +52,28 @@ def setup_logging(channel_name: str, log_dir: str, rotation_days: int, level: st
         )
 
     threading.excepthook = _thread_excepthook
+
+    _setup_libav_logging()
+
+
+def _setup_libav_logging() -> None:
+    """Route libav's internal av_log() output into Python logging.
+
+    Without this, a libav failure surfaces only as a bare errno on the raised
+    exception (e.g. "Invalid argument ... returned 22" = EINVAL), and the
+    descriptive text the muxer/encoder emits via av_log — e.g. "Application
+    provided invalid, non monotonically increasing dts to muxer in stream 0" —
+    is silently dropped. PyAV forwards av_log to Python loggers named
+    'libav.<component>' (libav.mov, libav.libx264, ...) once a capture level is
+    set; those propagate to the root handler configured above.
+
+    Level WARNING keeps errors + warnings but suppresses the chatty per-frame
+    INFO/VERBOSE output libx264 emits.
+    """
+    try:
+        import av.logging as avlog
+        avlog.set_level(avlog.WARNING)
+    except Exception as e:  # pragma: no cover - libav binding optional at import
+        logging.getLogger("ffrecord").warning(
+            "Could not configure libav logging bridge: %s", e,
+        )

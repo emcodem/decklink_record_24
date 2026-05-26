@@ -147,26 +147,73 @@ def _create_input_callback(
                     width = height = 0
 
                 fps_str = "unknown"
+                raw_frame_duration = None
+                raw_time_scale = None
                 try:
                     raw = newDisplayMode.GetFrameRate()
-                    fps_num, fps_den = int(raw[1]), int(raw[0])
+                    raw_frame_duration = int(raw[0])   # BMDTimeValue: duration of one frame
+                    raw_time_scale     = int(raw[1])   # BMDTimeScale: ticks per second
+                    fps_num, fps_den = raw_time_scale, raw_frame_duration
                     _framerate[0] = (fps_num, fps_den)
                     fps_str = f"{fps_num}/{fps_den}"
                 except Exception as e:
                     logger.error("GetFrameRate failed: %s", e)
 
+                field_dominance_raw = None
                 try:
-                    _field_dominance[0] = int(newDisplayMode.GetFieldDominance())
+                    field_dominance_raw = int(newDisplayMode.GetFieldDominance())
+                    _field_dominance[0] = field_dominance_raw
                 except Exception as e:
                     logger.warning("GetFieldDominance failed: %s", e)
 
-                progressive = bool(detectedSignalFlags & getattr(_dl, 'bmdDetectedVideoInputProgressive', 0x08))
-                scan = "progressive" if progressive else "interlaced"
+                mode_flags = None
+                try:
+                    mode_flags = int(newDisplayMode.GetFlags())
+                except Exception:
+                    pass
+
+                # detectedSignalFlags bit breakdown
+                _f = detectedSignalFlags
+                sig_ycbcr     = bool(_f & getattr(_dl, 'bmdDetectedVideoInputYCbCr422',    0x01))
+                sig_rgb       = bool(_f & getattr(_dl, 'bmdDetectedVideoInputRGB444',       0x02))
+                sig_dual3d    = bool(_f & getattr(_dl, 'bmdDetectedVideoInputDualStream3D', 0x04))
+                sig_prog      = bool(_f & getattr(_dl, 'bmdDetectedVideoInputProgressive',  0x08))
+                sig_psf       = bool(_f & getattr(_dl, 'bmdDetectedVideoInputPsF',          0x10))
+
+                # notificationEvents bit breakdown
+                _e = notificationEvents
+                evt_mode      = bool(_e & getattr(_dl, 'bmdVideoInputDisplayModeChanged',    0x01))
+                evt_dominance = bool(_e & getattr(_dl, 'bmdVideoInputFieldDominanceChanged', 0x02))
+                evt_colorsp   = bool(_e & getattr(_dl, 'bmdVideoInputColorspaceChanged',     0x04))
+
+                scan = "progressive" if sig_prog else ("psf" if sig_psf else "interlaced")
                 fmt_str = f"{mode_name} {width}x{height} {fps_str} {scan}"
 
+                fps_float = (raw_time_scale / raw_frame_duration) if (raw_time_scale and raw_frame_duration) else None
+
                 logger.info("=== DeckLink Signal Detected ===")
-                logger.info("  Mode      : %s", fmt_str)
-                logger.info("  Flags     : 0x%08x", detectedSignalFlags)
+                logger.info("  Mode name      : %s", mode_name)
+                logger.info("  Mode constant  : %s", mode_constant)
+                logger.info("  Geometry       : %dx%d", width, height)
+                logger.info("  GetFrameRate() : raw[0]=frameDuration=%s  raw[1]=timeScale=%s",
+                            raw_frame_duration, raw_time_scale)
+                logger.info("  Framerate tuple: fps_num=%s fps_den=%s  (%.6f fps)",
+                            fps_num if _framerate[0] else "n/a",
+                            fps_den if _framerate[0] else "n/a",
+                            fps_float if fps_float else 0.0)
+                logger.info("  FieldDominance : raw=0x%08x  (%s)",
+                            field_dominance_raw if field_dominance_raw is not None else 0,
+                            {0x75707072: "UpperFieldFirst/TFF", 0x6C6F7772: "LowerFieldFirst/BFF",
+                             0: "Progressive", 1: "BFF", 2: "TFF"}.get(
+                                field_dominance_raw, f"unknown({field_dominance_raw})")
+                            if field_dominance_raw is not None else "n/a")
+                logger.info("  ModeFlags      : %s", hex(mode_flags) if mode_flags is not None else "n/a")
+                logger.info("  detectedSignalFlags: 0x%08x  YCbCr422=%s RGB444=%s DualStream3D=%s "
+                            "Progressive=%s PsF=%s",
+                            _f, sig_ycbcr, sig_rgb, sig_dual3d, sig_prog, sig_psf)
+                logger.info("  notificationEvents : 0x%08x  DisplayModeChanged=%s "
+                            "FieldDominanceChanged=%s ColorspaceChanged=%s",
+                            _e, evt_mode, evt_dominance, evt_colorsp)
                 logger.info("================================")
 
                 _current_mode[0] = mode_constant

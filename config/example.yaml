@@ -75,7 +75,7 @@ capture:
   #   bwdif=mode=1:parity=-1:deint=0,format=yuv420p              # 25i → 50p
   #   scale=1280:720:flags=lanczos,format=yuv420p                # downscale
   #   drawtext=text='CH1, live':fontsize=24:x=10:y=10,format=yuv420p   # quoted comma
-  video_filter: "yadif=mode=0:parity=auto:deint=interlaced,format=yuv420p"
+  video_filter: ""
 
 http:
   bind: 127.0.0.1                # Supported: any IPv4/IPv6 address string. 0.0.0.0 = all interfaces.
@@ -278,12 +278,12 @@ outputs:
       enabled: true                          # close+reopen container per segment so each file
       seconds: 10                            # plays from PTS=0 — frame-exact 10 s chunks.
     video:
-      codec: libx264                         # `-c:v libx264`
-      profile: high                          # `-profile:v high`
-      pix_fmt: yuv420p                       # `-pix_fmt yuv420p`
-      preset: ultrafast                      # `-preset ultrafast` — temp test preset
+      codec: hevc_nvenc                      # `-c:v hevc_nvenc`
+      profile: main10                        # `-profile:v main10`
+      pix_fmt: p010le                        # `-pix_fmt p010le` (10-bit NV12)
+      preset: p7                             # `-preset p7` — best quality NVENC preset
       bitrate: "50M"                         # `-b:v 50M`
-      gop: 1                                 # all I-frames — test for MOV mux bug
+      gop: auto                              # codec-default GOP
     audio:
       channels: [1, 2, 3, 4, 5, 6, 7, 8]     # archive all 8 SDI channels
       downmix: none

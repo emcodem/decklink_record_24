@@ -249,12 +249,12 @@ class EncoderOutput(OutputThread):
                     encoder_input_interlaced = bool(frame.interlaced_frame)
                     encoder_input_tff = bool(frame.top_field_first)
 
-                filtered_frames = list(vfilter.process(frame.data)) if vfilter else [frame.data]
+                frames_to_encode = list(vfilter.process(frame.data)) if vfilter else [pair.video.av_frame]
 
                 # L4: per-output filter yielded no frames for this pair.
                 # Surface it as a graduated WARNING so mid-stream filter
                 # dropouts are visible instead of being silently dropped.
-                if not filtered_frames:
+                if not frames_to_encode:
                     filter_dropouts_total += 1
                     self._maybe_log_filter_dropout(filter_dropouts_total)
                     if container is None:
@@ -262,7 +262,6 @@ class EncoderOutput(OutputThread):
 
                 eff_w = vfilter.output_width if vfilter else frame.width
                 eff_h = vfilter.output_height if vfilter else frame.height
-                eff_fmt = map_pix_fmt(vfilter.output_pix_fmt if vfilter else frame.fmt)
                 eff_framerate = vfilter.output_framerate if vfilter else frame.framerate
 
                 # Container/stream setup on first frame — adopt pre-warmed if
@@ -306,17 +305,10 @@ class EncoderOutput(OutputThread):
                     )
 
                 # ── encode video ────────────────────────────────────────
-                # Path A: vfilter is None AND pair.video.av_frame is available
-                #         → encode the AVFrame directly. Interlaced metadata
-                #         survives from the channel-level filter without a
-                #         per-frame setfield (avoids the PyAV 17 thread-safety
-                #         bug at full-HD).
-                # Path B: vfilter applied a transform OR av_frame unavailable
-                #         → rebuild from numpy via from_ndarray.
-                if vfilter is None and pair.video.av_frame is not None and filtered_frames:
+                for av_frame in frames_to_encode:
                     try:
-                        av_frame = pair.video.av_frame
                         av_frame.pts = seg_v_pts
+                        av_frame.time_base = vstream.codec_context.time_base
                         pkt_count = 0
                         _t0 = time.monotonic() if self.stats.frames_written == 0 else 0.0
                         for pkt in vstream.encode(av_frame):
@@ -325,36 +317,16 @@ class EncoderOutput(OutputThread):
                         self.video_pkts_muxed += pkt_count
                         if self.stats.frames_written == 0:
                             self._log.info(
-                                "First video frame encoded via AVFrame (produced %d packet(s)) "
-                                "in %.3fs [interlaced=%s tff=%s]",
+                                "First video frame encoded (produced %d packet(s)) in %.3fs "
+                                "[interlaced=%s tff=%s]",
                                 pkt_count, time.monotonic() - _t0,
-                                av_frame.interlaced_frame,
+                                getattr(av_frame, 'interlaced_frame', '?'),
                                 getattr(av_frame, 'top_field_first', '?'),
                             )
                         seg_v_pts += 1
                         self.stats.frames_written += 1
                     except Exception as e:
-                        self._log.error("Video encode error (AVFrame path): %s", e, exc_info=True)
-                else:
-                    for arr in filtered_frames:
-                        try:
-                            av_frame = av.VideoFrame.from_ndarray(arr, format=eff_fmt)
-                            av_frame.pts = seg_v_pts
-                            pkt_count = 0
-                            _t0 = time.monotonic() if self.stats.frames_written == 0 else 0.0
-                            for pkt in vstream.encode(av_frame):
-                                if mux_with_logging(container, pkt, self.name, self.mux_counters, kind="video"):
-                                    pkt_count += 1
-                            self.video_pkts_muxed += pkt_count
-                            if self.stats.frames_written == 0:
-                                self._log.info(
-                                    "First video frame encoded via numpy (produced %d packet(s)) in %.3fs",
-                                    pkt_count, time.monotonic() - _t0,
-                                )
-                            seg_v_pts += 1
-                            self.stats.frames_written += 1
-                        except Exception as e:
-                            self._log.error("Video encode error (numpy path): %s", e, exc_info=True)
+                        self._log.error("Video encode error: %s", e, exc_info=True)
 
                 # ── encode audio paired with this video frame ──────────
                 try:

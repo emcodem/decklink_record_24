@@ -251,7 +251,7 @@ class OutputVideoFilter:
         graph.configure()
         return graph, src, sink
 
-    def process(self, arr: np.ndarray) -> Generator[np.ndarray, None, None]:
+    def process(self, arr: np.ndarray) -> Generator[av.VideoFrame, None, None]:
         av_frame = av.VideoFrame.from_ndarray(arr, format=self.input_pix_fmt)
         av_frame.pts = self._push_count
         self._push_count += 1
@@ -271,7 +271,7 @@ class OutputVideoFilter:
                         self.output_pix_fmt = fmt_name
                 except (AttributeError, TypeError):
                     pass
-            yield out.to_ndarray(format=self.output_pix_fmt)
+            yield out
 
     def close(self) -> None:
         self._graph = self._src = self._sink = None

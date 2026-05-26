@@ -147,6 +147,8 @@ def build_video_stream(
     fps_num, fps_den = framerate if framerate[1] else (framerate[0], 1)
     rate = fractions.Fraction(fps_num, fps_den) if fps_den else fractions.Fraction(fps_num, 1)
     stream = container.add_stream(vcfg.codec, rate=rate)
+    stream.codec_context.framerate = rate
+    stream.codec_context.time_base = fractions.Fraction(fps_den, fps_num)
 
     codec_opts: dict[str, str] = {}
     if vcfg.profile:
@@ -227,6 +229,27 @@ class MuxCounters:
         self.total_failures = 0
 
 
+def _ffmpeg_error_detail(e: Exception) -> str:
+    """Pull libav's descriptive message + errno off a PyAV exception.
+
+    PyAV attaches the last av_log line to the exception as
+    e.log = (level:int, name:str, message:str). The bare str(e) is often just
+    "Invalid argument: '...' returned 22" — the real reason lives in e.log.
+    """
+    bits = [f"{type(e).__name__}: {e}"]
+    log = getattr(e, "log", None)
+    if log:
+        try:
+            _level, name, message = log
+            bits.append(f"libav[{name}]: {message.strip()}")
+        except Exception:
+            bits.append(f"libav_log={log!r}")
+    errno = getattr(e, "errno", None)
+    if errno is not None:
+        bits.append(f"errno={errno}")
+    return " | ".join(bits)
+
+
 def mux_with_logging(
     container,
     packet,
@@ -250,5 +273,10 @@ def mux_with_logging(
             counters.audio_failures += 1
         else:
             counters.video_failures += 1
-        log_mux_failure(output_name, f"{kind}: {type(e).__name__}: {e}", counters.total_failures)
+        detail = _ffmpeg_error_detail(e)
+        logger.warning(
+            "[mux] FAILED output=%s kind=%s %s",
+            output_name, kind, detail,
+        )
+        log_mux_failure(output_name, f"{kind}: {detail}", counters.total_failures)
         return False
