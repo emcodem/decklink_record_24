@@ -278,12 +278,12 @@ outputs:
       enabled: true                          # close+reopen container per segment so each file
       seconds: 10                            # plays from PTS=0 — frame-exact 10 s chunks.
     video:
-      codec: hevc_nvenc                      # `-c:v hevc_nvenc`
-      profile: main10                        # `-profile:v main10` — 10-bit HEVC
-      pix_fmt: p010le                        # `-pix_fmt p010le` — 10-bit semi-planar
-      preset: p7                             # `-preset p7` — NVENC slowest/highest quality
+      codec: libx264                         # `-c:v libx264`
+      profile: high                          # `-profile:v high`
+      pix_fmt: yuv420p                       # `-pix_fmt yuv420p`
+      preset: ultrafast                      # `-preset ultrafast` — temp test preset
       bitrate: "50M"                         # `-b:v 50M`
-      gop: auto                              # leave to codec default (no `-g` flag)
+      gop: 1                                 # all I-frames — test for MOV mux bug
     audio:
       channels: [1, 2, 3, 4, 5, 6, 7, 8]     # archive all 8 SDI channels
       downmix: none
