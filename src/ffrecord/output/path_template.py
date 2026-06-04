@@ -13,7 +13,10 @@ Supported placeholders:
 from __future__ import annotations
 
 import datetime
+import logging
 from pathlib import Path
+
+_log = logging.getLogger(__name__)
 
 
 def render(template: str, *, output_name: str, channel_name: str,
@@ -34,5 +37,11 @@ def render(template: str, *, output_name: str, channel_name: str,
 
 def ensure_parent(path: str) -> Path:
     p = Path(path).resolve()
-    p.parent.mkdir(parents=True, exist_ok=True)
+    parent = p.parent
+    existed = parent.exists()
+    if not existed:
+        parent.mkdir(parents=True, exist_ok=True)
+    now_exists = parent.exists()
+    if not existed:
+        _log.info("ensure_parent: created %s (exists=%s)", parent, now_exists)
     return p
