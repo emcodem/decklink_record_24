@@ -91,7 +91,7 @@ def _parse_bmd_format(fmt: str) -> tuple[int, int, tuple[int, int]]:
 def _is_interlaced_format(fmt: str) -> bool:
     """True iff the BMD mode name indicates interlaced scan (e.g. bmdModeHD1080i50)."""
     import re
-    return bool(re.search(r"[iI]\d+$", fmt))
+    return bool(re.search(r"[iI]\d+", fmt))
 
 # Maximum raw frames to buffer before dropping; each 1080i50 frame is ~4 MB,
 # so 30 frames ≈ 120 MB and absorbs any startup filter-init spike.
@@ -561,6 +561,8 @@ class Service:
         yet (so the watchdog has a sensible threshold during startup).
         """
         fmt = self._current_format or self.config.channel.expected_format
+        if fmt not in _BMD_FORMAT_TABLE:
+            fmt = self.config.channel.expected_format
         try:
             _, _, (num, den) = _parse_bmd_format(fmt)
             if num > 0 and den > 0:
